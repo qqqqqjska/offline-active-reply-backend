@@ -443,6 +443,33 @@ function fallbackMessage(contactName, lastMessage) {
     return `${name}隔了一会儿又来找你：我突然想到一件事，想继续和你说。`;
 }
 
+function serializeContactRow(row) {
+    if (!row) return null;
+    return {
+        ...row,
+        userId: row.user_id,
+        contactId: String(row.contact_id),
+        personaPrompt: row.persona_prompt || '',
+        contextLimit: Number(row.context_limit || 0),
+        activeReplyEnabled: !!row.active_reply_enabled,
+        activeReplyIntervalSec: Number(row.active_reply_interval_sec || 0),
+        activeReplyStartTime: Number(row.active_reply_start_time || 0),
+        lastTriggeredMsgId: row.last_triggered_msg_id || null,
+        lastSeenMessageId: row.last_seen_message_id || null,
+        createdAt: Number(row.created_at || 0),
+        updatedAt: Number(row.updated_at || 0)
+    };
+}
+
+function serializeMessageRow(row) {
+    if (!row) return null;
+    return {
+        ...row,
+        userId: row.user_id,
+        contactId: String(row.contact_id)
+    };
+}
+
 function getSubscriptionsByUser(userId) {
     return listSubscriptionsByUserStmt.all(userId).map((row) => {
         try {
@@ -642,6 +669,7 @@ async function createOfflineMessage(row, now) {
     let insertedCount = 0;
     let firstMessageId = null;
     let firstContent = normalizedMessages[0].content;
+    const insertedMessages = [];
 
     normalizedMessages.forEach((messageItem, index) => {
         const messageTime = now + index;
@@ -660,6 +688,12 @@ async function createOfflineMessage(row, now) {
         });
         if (insertResult.changes) {
             insertedCount += 1;
+            insertedMessages.push({
+                id: messageId,
+                content: messageItem.content,
+                type: messageItem.type || 'text',
+                time: messageTime
+            });
             if (!firstMessageId) {
                 firstMessageId = messageId;
             }
@@ -672,20 +706,29 @@ async function createOfflineMessage(row, now) {
 
     updateTriggerStateStmt.run(firstMessageId, now, row.message_id, now, row.user_id, String(row.contact_id));
 
-    const payload = {
-        title: row.name ? `${row.name} sent a message` : 'New message',
-        body: firstContent,
-        tag: `contact-${row.contact_id}`,
-        contactId: String(row.contact_id),
-        url: `./?contactId=${encodeURIComponent(String(row.contact_id))}&openChat=1`,
-        data: {
-            contactId: String(row.contact_id),
-            messageId: firstMessageId,
-            url: `./?contactId=${encodeURIComponent(String(row.contact_id))}&openChat=1`
-        }
+    const push = {
+        enabled: PUSH_ENABLED,
+        delivered: 0,
+        removed: 0,
+        attempted: 0
     };
-
-    const push = await sendPushToUser(row.user_id, payload);
+    for (const insertedMessage of insertedMessages) {
+        const pushResult = await sendPushToUser(row.user_id, {
+            title: row.name ? `${row.name} sent a message` : 'New message',
+            body: insertedMessage.content,
+            tag: `contact-${row.contact_id}-${insertedMessage.id}`,
+            contactId: String(row.contact_id),
+            url: `./?contactId=${encodeURIComponent(String(row.contact_id))}&openChat=1`,
+            data: {
+                contactId: String(row.contact_id),
+                messageId: insertedMessage.id,
+                url: `./?contactId=${encodeURIComponent(String(row.contact_id))}&openChat=1`
+            }
+        });
+        push.attempted += 1;
+        push.delivered += Number(pushResult && pushResult.delivered || 0);
+        push.removed += Number(pushResult && pushResult.removed || 0);
+    }
 
     return {
         id: firstMessageId,
@@ -818,7 +861,7 @@ app.post('/api/contacts', (req, res) => {
 
 app.get('/api/contacts/active-reply-config', (req, res) => {
     const userId = req.query.userId || 'default-user';
-    const contacts = db.prepare(`SELECT * FROM contacts WHERE user_id = ?`).all(userId);
+    const contacts = db.prepare(`SELECT * FROM contacts WHERE user_id = ?`).all(userId).map(serializeContactRow).filter(Boolean);
     res.json({ contacts, serverTime: Date.now() });
 });
 
@@ -842,7 +885,7 @@ app.post('/api/messages/sync', (req, res) => {
     const body = req.body || {};
     const userId = body.userId || 'default-user';
     const since = Number(body.since || 0);
-    const messages = db.prepare(`SELECT * FROM messages WHERE user_id = ? AND time > ? ORDER BY time ASC`).all(userId, since);
+    const messages = db.prepare(`SELECT * FROM messages WHERE user_id = ? AND time > ? ORDER BY time ASC`).all(userId, since).map(serializeMessageRow).filter(Boolean);
     res.json({ messages, serverTime: Date.now() });
 });
 
