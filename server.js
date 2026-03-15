@@ -537,6 +537,23 @@ async function generateAiReplyContent(row, minutesPassed) {
     ];
 
     try {
+        console.log('[offline-ai] prompt summary', JSON.stringify({
+            userId: row.user_id,
+            contactId: String(row.contact_id),
+            messageCount: messages.length,
+            contextMessageCount: Math.max(0, messages.length - 1),
+            systemPromptLength: systemPrompt.length,
+            systemPromptPreview: systemPrompt.slice(0, 500),
+            recentMessagePreview: messages.slice(-3).map((item) => ({
+                role: item.role,
+                contentPreview: String(item.content || '').slice(0, 160)
+            }))
+        }));
+    } catch (promptLogErr) {
+        console.error('[offline-ai] prompt summary logging failed', promptLogErr);
+    }
+
+    try {
         const response = await fetch(normalizeApiUrl(profile.api_url), {
             method: 'POST',
             headers: {
