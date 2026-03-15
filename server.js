@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS contacts (
   contact_id TEXT NOT NULL,
   name TEXT,
   persona_prompt TEXT,
+  context_limit INTEGER NOT NULL DEFAULT 50,
   active_reply_enabled INTEGER NOT NULL DEFAULT 0,
   active_reply_interval_sec INTEGER NOT NULL DEFAULT 60,
   active_reply_start_time INTEGER DEFAULT 0,
@@ -96,33 +97,36 @@ CREATE TABLE IF NOT EXISTS messages (
   source TEXT NOT NULL DEFAULT 'offline-backend'
 );
 
+CREATE TABLE IF NOT EXISTS chat_contexts (
+  user_id TEXT NOT NULL,
+  contact_id TEXT NOT NULL,
+  messages_json TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, contact_id)
+);
+
+CREATE TABLE IF NOT EXISTS ai_profiles (
+  user_id TEXT PRIMARY KEY,
+  api_url TEXT NOT NULL DEFAULT '',
+  api_key TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  temperature REAL NOT NULL DEFAULT 0.7,
+  updated_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_user_time ON messages(user_id, time);
 `);
 
 app.use(cors({ origin: APP_ORIGIN === '*' ? true : APP_ORIGIN, credentials: false }));
-app.use(express.json({ limit: '1mb' }));
-
-function buildActiveReplyPrompt(lastMessage, minutesPassed) {
-    if (lastMessage && lastMessage.role === 'user') {
-        return `Active reply triggered ${minutesPassed} minute(s) after the user's last message. Reply naturally and stay in persona.`;
-    }
-    return `Active reply triggered ${minutesPassed} minute(s) after silence. Continue the conversation naturally and stay in persona.`;
-}
-
-function fallbackMessage(contactName, lastMessage) {
-    const name = contactName || 'They';
-    if (lastMessage && lastMessage.role === 'user') {
-        return `Just saw your last message. ${name} wanted to reply and keep chatting.`;
-    }
-    return `${name} came back after a short pause and wanted to continue the conversation.`;
-}
+app.use(express.json({ limit: '2mb' }));
 
 const upsertContactStmt = db.prepare(`
-INSERT INTO contacts (user_id, contact_id, name, persona_prompt, active_reply_enabled, active_reply_interval_sec, active_reply_start_time, last_triggered_msg_id, created_at, updated_at)
-VALUES (@user_id, @contact_id, @name, @persona_prompt, @active_reply_enabled, @active_reply_interval_sec, @active_reply_start_time, @last_triggered_msg_id, @created_at, @updated_at)
+INSERT INTO contacts (user_id, contact_id, name, persona_prompt, context_limit, active_reply_enabled, active_reply_interval_sec, active_reply_start_time, last_triggered_msg_id, created_at, updated_at)
+VALUES (@user_id, @contact_id, @name, @persona_prompt, @context_limit, @active_reply_enabled, @active_reply_interval_sec, @active_reply_start_time, @last_triggered_msg_id, @created_at, @updated_at)
 ON CONFLICT(user_id, contact_id) DO UPDATE SET
   name=excluded.name,
   persona_prompt=excluded.persona_prompt,
+  context_limit=excluded.context_limit,
   active_reply_enabled=excluded.active_reply_enabled,
   active_reply_interval_sec=excluded.active_reply_interval_sec,
   active_reply_start_time=excluded.active_reply_start_time,
@@ -167,6 +171,47 @@ WHERE user_id = ? AND contact_id = ?
 
 const deleteSubscriptionByEndpointStmt = db.prepare(`DELETE FROM device_subscriptions WHERE endpoint = ?`);
 const listSubscriptionsByUserStmt = db.prepare(`SELECT subscription_json, endpoint FROM device_subscriptions WHERE user_id = ?`);
+const upsertChatContextStmt = db.prepare(`
+INSERT INTO chat_contexts (user_id, contact_id, messages_json, updated_at)
+VALUES (@user_id, @contact_id, @messages_json, @updated_at)
+ON CONFLICT(user_id, contact_id) DO UPDATE SET
+  messages_json=excluded.messages_json,
+  updated_at=excluded.updated_at
+`);
+const getChatContextStmt = db.prepare(`SELECT messages_json FROM chat_contexts WHERE user_id = ? AND contact_id = ?`);
+const upsertAiProfileStmt = db.prepare(`
+INSERT INTO ai_profiles (user_id, api_url, api_key, model, temperature, updated_at)
+VALUES (@user_id, @api_url, @api_key, @model, @temperature, @updated_at)
+ON CONFLICT(user_id) DO UPDATE SET
+  api_url=excluded.api_url,
+  api_key=excluded.api_key,
+  model=excluded.model,
+  temperature=excluded.temperature,
+  updated_at=excluded.updated_at
+`);
+const getAiProfileStmt = db.prepare(`SELECT * FROM ai_profiles WHERE user_id = ?`);
+
+function normalizeApiUrl(url) {
+    const value = String(url || '').trim();
+    if (!value) return '';
+    if (value.endsWith('/chat/completions')) return value;
+    return value.endsWith('/') ? `${value}chat/completions` : `${value}/chat/completions`;
+}
+
+function buildActiveReplyInstruction(lastMessage, minutesPassed) {
+    if (lastMessage && lastMessage.role === 'user') {
+        return `（系统提示：主动发消息模式触发。距离用户上一条消息已过去 ${minutesPassed} 分钟。请在不打断人设的前提下自然接住对方刚才的话；可以轻描淡写解释回复稍晚，也可以直接顺着话题继续。）`;
+    }
+    return `（系统提示：主动发消息模式触发。距离你上一条消息已过去 ${minutesPassed} 分钟，用户一直没有回复。请像真人间隔一阵后自然续聊：可以补一句、换个轻话题，或分享当下状态/见闻；不要写成系统通知或任务播报。）`;
+}
+
+function fallbackMessage(contactName, lastMessage) {
+    const name = contactName || '对方';
+    if (lastMessage && lastMessage.role === 'user') {
+        return `刚刚在忙，现在看到啦。${name}想接着和你聊。`;
+    }
+    return `${name}隔了一会儿又来找你：我突然想到一件事，想继续和你说。`;
+}
 
 function getSubscriptionsByUser(userId) {
     return listSubscriptionsByUserStmt.all(userId).map((row) => {
@@ -211,10 +256,98 @@ async function sendPushToUser(userId, payload) {
     return { enabled: true, delivered, removed };
 }
 
+function getRecentChatContext(userId, contactId) {
+    const row = getChatContextStmt.get(userId, String(contactId));
+    if (!row || !row.messages_json) return [];
+    try {
+        const parsed = JSON.parse(row.messages_json);
+        return Array.isArray(parsed) ? parsed : [];
+    } catch (err) {
+        return [];
+    }
+}
+
+function getAiProfile(userId) {
+    return getAiProfileStmt.get(userId) || null;
+}
+
+async function generateAiReplyContent(row, minutesPassed) {
+    const profile = getAiProfile(row.user_id);
+    const recentContext = getRecentChatContext(row.user_id, row.contact_id);
+    const instruction = buildActiveReplyInstruction(row, minutesPassed);
+
+    if (!profile || !profile.api_url || !profile.api_key || !profile.model) {
+        return {
+            content: fallbackMessage(row.name || '对方', row),
+            usedFallback: true,
+            debug: 'missing_ai_profile'
+        };
+    }
+
+    const messages = [];
+    const personaPrompt = String(row.persona_prompt || '').trim();
+    const systemSections = [
+        `你正在扮演聊天联系人「${row.name || '联系人'}」。`,
+        personaPrompt ? `【人设】\n${personaPrompt}` : '',
+        '【回复要求】\n- 用聊天口吻自然回复。\n- 不要提到自己是 AI、系统、脚本。\n- 不要写成通知文案。\n- 只输出用户可见的回复正文。'
+    ].filter(Boolean);
+
+    messages.push({ role: 'system', content: systemSections.join('\n\n') });
+
+    const contextLimit = Number(row.context_limit || 50) > 0 ? Number(row.context_limit) : 50;
+    const trimmedContext = recentContext.slice(-contextLimit).map((message) => ({
+        role: message && message.role === 'user' ? 'user' : 'assistant',
+        content: String(message && message.content ? message.content : '').slice(0, 1200)
+    })).filter((item) => item.content);
+
+    messages.push(...trimmedContext);
+    messages.push({ role: 'system', content: instruction });
+
+    try {
+        const response = await fetch(normalizeApiUrl(profile.api_url), {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${String(profile.api_key || '').trim()}`
+            },
+            body: JSON.stringify({
+                model: profile.model,
+                messages,
+                temperature: Number(profile.temperature || 0.7)
+            })
+        });
+
+        if (!response.ok) {
+            const text = await response.text().catch(() => '');
+            throw new Error(`API ${response.status}: ${text || response.statusText}`);
+        }
+
+        const data = await response.json();
+        const content = String(data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content || '').trim();
+        if (!content) {
+            throw new Error('empty ai reply');
+        }
+
+        return {
+            content: content.replace(/<thinking>[\s\S]*?<\/thinking>/g, '').replace(/<think>[\s\S]*?<\/think>/g, '').trim() || fallbackMessage(row.name || '对方', row),
+            usedFallback: false,
+            debug: 'ai_generated'
+        };
+    } catch (err) {
+        console.error('[offline-ai] generateAiReplyContent failed', err);
+        return {
+            content: fallbackMessage(row.name || '对方', row),
+            usedFallback: true,
+            debug: err && err.message ? err.message : 'ai_error'
+        };
+    }
+}
+
 async function createOfflineMessage(row, now) {
     const minutesPassed = Math.max(1, Math.floor((now - Number(row.time || now)) / 60000));
-    const prompt = buildActiveReplyPrompt(row, minutesPassed);
-    const content = fallbackMessage(row.name || 'Contact', row);
+    const generated = await generateAiReplyContent(row, minutesPassed);
+    const prompt = buildActiveReplyInstruction(row, minutesPassed);
+    const content = generated.content;
     const messageId = `offline-${row.user_id}-${row.contact_id}-${row.message_id}-${now}`;
 
     const insertResult = insertMessageStmt.run({
@@ -256,13 +389,15 @@ async function createOfflineMessage(row, now) {
         contactId: String(row.contact_id),
         content,
         time: now,
-        push
+        push,
+        usedFallback: generated.usedFallback,
+        debug: generated.debug
     };
 }
 
 async function runActiveReplyCheck() {
     const rows = db.prepare(`
-        SELECT c.user_id, c.contact_id, c.name, c.active_reply_enabled, c.active_reply_interval_sec, c.active_reply_start_time, c.last_triggered_msg_id,
+        SELECT c.user_id, c.contact_id, c.name, c.persona_prompt, c.context_limit, c.active_reply_enabled, c.active_reply_interval_sec, c.active_reply_start_time, c.last_triggered_msg_id,
                s.message_id, s.role, s.content, s.type, s.time
         FROM contacts c
         LEFT JOIN message_snapshots s ON s.user_id = c.user_id AND s.contact_id = c.contact_id
@@ -313,6 +448,32 @@ app.post('/api/push/subscribe', (req, res) => {
     res.json({ ok: true, pushEnabled: PUSH_ENABLED });
 });
 
+app.post('/api/ai-profile', (req, res) => {
+    const body = req.body || {};
+    const now = Date.now();
+    upsertAiProfileStmt.run({
+        user_id: body.userId || 'default-user',
+        api_url: String(body.apiUrl || '').trim(),
+        api_key: String(body.apiKey || '').trim(),
+        model: String(body.model || '').trim(),
+        temperature: Number(body.temperature || 0.7),
+        updated_at: now
+    });
+    res.json({ ok: true });
+});
+
+app.post('/api/chat-context', (req, res) => {
+    const body = req.body || {};
+    const messages = Array.isArray(body.messages) ? body.messages : [];
+    upsertChatContextStmt.run({
+        user_id: body.userId || 'default-user',
+        contact_id: String(body.contactId),
+        messages_json: JSON.stringify(messages.slice(-20)),
+        updated_at: Date.now()
+    });
+    res.json({ ok: true, count: messages.length });
+});
+
 app.post('/api/contacts', (req, res) => {
     const body = req.body || {};
     const now = Date.now();
@@ -321,6 +482,7 @@ app.post('/api/contacts', (req, res) => {
         contact_id: String(body.contactId),
         name: body.name || '',
         persona_prompt: body.personaPrompt || '',
+        context_limit: Math.max(0, Math.round(Number(body.contextLimit || 0))) || 50,
         active_reply_enabled: body.activeReplyEnabled ? 1 : 0,
         active_reply_interval_sec: Math.max(1, Math.round(Number(body.activeReplyInterval || 1) * 60)),
         active_reply_start_time: Number(body.activeReplyStartTime || 0),
@@ -374,7 +536,7 @@ app.post('/api/messages/mark-read', (req, res) => {
 app.post('/api/debug/trigger-active-reply', async (req, res) => {
     const body = req.body || {};
     const row = db.prepare(`
-        SELECT c.user_id, c.contact_id, c.name, c.active_reply_enabled, c.active_reply_interval_sec, c.active_reply_start_time, c.last_triggered_msg_id,
+        SELECT c.user_id, c.contact_id, c.name, c.persona_prompt, c.context_limit, c.active_reply_enabled, c.active_reply_interval_sec, c.active_reply_start_time, c.last_triggered_msg_id,
                s.message_id, s.role, s.content, s.type, s.time
         FROM contacts c
         LEFT JOIN message_snapshots s ON s.user_id = c.user_id AND s.contact_id = c.contact_id
@@ -416,3 +578,4 @@ app.listen(PORT, () => {
         console.log('[push] Copy these values into your Render environment variables if you want stable push subscriptions across redeploys');
     }
 });
+
