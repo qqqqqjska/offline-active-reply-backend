@@ -24,6 +24,7 @@ if (!vapidPublicKey || !vapidPrivateKey) {
 }
 
 const PUSH_ENABLED = Boolean(vapidPublicKey && vapidPrivateKey && vapidSubject);
+let activeReplyCheckPromise = null;
 
 if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -58,6 +59,7 @@ CREATE TABLE IF NOT EXISTS contacts (
   user_id TEXT NOT NULL,
   contact_id TEXT NOT NULL,
   name TEXT,
+  avatar_url TEXT,
   persona_prompt TEXT,
   context_limit INTEGER NOT NULL DEFAULT 50,
   active_reply_enabled INTEGER NOT NULL DEFAULT 0,
@@ -132,14 +134,20 @@ CREATE TABLE IF NOT EXISTS prompt_contexts (
 CREATE INDEX IF NOT EXISTS idx_messages_user_time ON messages(user_id, time);
 `);
 
+const contactTableColumns = db.prepare(`PRAGMA table_info(contacts)`).all();
+if (!contactTableColumns.some((column) => column && column.name === 'avatar_url')) {
+    db.exec(`ALTER TABLE contacts ADD COLUMN avatar_url TEXT`);
+}
+
 app.use(cors({ origin: APP_ORIGIN === '*' ? true : APP_ORIGIN, credentials: false }));
 app.use(express.json({ limit: '2mb' }));
 
 const upsertContactStmt = db.prepare(`
-INSERT INTO contacts (user_id, contact_id, name, persona_prompt, context_limit, active_reply_enabled, active_reply_interval_sec, active_reply_start_time, last_triggered_msg_id, created_at, updated_at)
-VALUES (@user_id, @contact_id, @name, @persona_prompt, @context_limit, @active_reply_enabled, @active_reply_interval_sec, @active_reply_start_time, @last_triggered_msg_id, @created_at, @updated_at)
+INSERT INTO contacts (user_id, contact_id, name, avatar_url, persona_prompt, context_limit, active_reply_enabled, active_reply_interval_sec, active_reply_start_time, last_triggered_msg_id, created_at, updated_at)
+VALUES (@user_id, @contact_id, @name, @avatar_url, @persona_prompt, @context_limit, @active_reply_enabled, @active_reply_interval_sec, @active_reply_start_time, @last_triggered_msg_id, @created_at, @updated_at)
 ON CONFLICT(user_id, contact_id) DO UPDATE SET
   name=excluded.name,
+  avatar_url=excluded.avatar_url,
   persona_prompt=excluded.persona_prompt,
   context_limit=excluded.context_limit,
   active_reply_enabled=excluded.active_reply_enabled,
@@ -466,15 +474,20 @@ function extractVisibleMessagesFromMixedResponse(rawText) {
                 return;
             }
             if (item.type === 'sticker_message' && typeof item.sticker === 'string' && item.sticker.trim()) {
-                visibleMessages.push({ type: 'text', content: `[表情包] ${item.sticker.trim()}` });
+                const stickerName = item.sticker.trim();
+                visibleMessages.push({ type: 'sticker', content: stickerName, description: stickerName });
                 return;
             }
             if (item.type === 'image' && typeof item.content === 'string' && item.content.trim()) {
-                visibleMessages.push(...splitPlainTextMessages(item.content));
+                const imageContent = item.content.trim();
+                const imageDescription = typeof item.prompt === 'string' && item.prompt.trim()
+                    ? item.prompt.trim()
+                    : (typeof item.description === 'string' && item.description.trim() ? item.description.trim() : imageContent);
+                visibleMessages.push({ type: 'image', content: imageContent, description: imageDescription });
                 return;
             }
             if (item.type === 'voice' && typeof item.content === 'string' && item.content.trim()) {
-                visibleMessages.push(...splitPlainTextMessages(item.content));
+                visibleMessages.push({ type: 'voice', content: item.content.trim() });
             }
         });
         return visibleMessages;
@@ -549,6 +562,7 @@ function serializeContactRow(row) {
         ...row,
         userId: row.user_id,
         contactId: String(row.contact_id),
+        avatarUrl: row.avatar_url || '',
         personaPrompt: row.persona_prompt || '',
         contextLimit: Number(row.context_limit || 0),
         activeReplyEnabled: !!row.active_reply_enabled,
@@ -568,6 +582,14 @@ function serializeMessageRow(row) {
         userId: row.user_id,
         contactId: String(row.contact_id)
     };
+}
+
+function resolvePushAvatarUrl(row) {
+    const candidate = String((row && (row.avatar_url || row.avatarUrl)) || '').trim();
+    if (/^https?:\/\//i.test(candidate)) return candidate;
+    if (/^data:image\//i.test(candidate) && candidate.length <= 1800) return candidate;
+    const seed = encodeURIComponent(String((row && (row.name || row.contact_id)) || 'contact'));
+    return `https://api.dicebear.com/7.x/avataaars/svg?seed=${seed}`;
 }
 
 function getSubscriptionsByUser(userId) {
@@ -759,16 +781,31 @@ async function createOfflineMessage(row, now) {
     const visibleMessages = extractVisibleMessagesFromMixedResponse(generated.content)
         .map((item) => ({
             type: item.type || 'text',
-            content: String(item.content || '').trim()
+            content: String(item.content || '').trim(),
+            description: typeof item.description === 'string' && item.description.trim() ? item.description.trim() : null
         }))
         .filter((item) => item.content);
     const normalizedMessages = visibleMessages.length > 0
         ? visibleMessages
         : [{ type: 'text', content: fallbackMessage(row.name || '对方', row) }];
 
+    const getPreviewText = (messageItem) => {
+        if (!messageItem || typeof messageItem !== 'object') return '';
+        if (messageItem.type === 'sticker') {
+            return `[表情包] ${messageItem.description || messageItem.content || ''}`.trim();
+        }
+        if (messageItem.type === 'image' || messageItem.type === 'virtual_image') {
+            return '[图片]';
+        }
+        if (messageItem.type === 'voice') {
+            return '[语音]';
+        }
+        return String(messageItem.content || '').trim();
+    };
+
     let insertedCount = 0;
     let firstMessageId = null;
-    let firstContent = normalizedMessages[0].content;
+    let firstContent = getPreviewText(normalizedMessages[0]);
     const insertedMessages = [];
 
     normalizedMessages.forEach((messageItem, index) => {
@@ -781,7 +818,7 @@ async function createOfflineMessage(row, now) {
             role: 'assistant',
             content: messageItem.content,
             type: messageItem.type || 'text',
-            description: prompt,
+            description: messageItem.description || prompt,
             time: messageTime,
             read: 0,
             source: 'offline-backend'
@@ -791,6 +828,7 @@ async function createOfflineMessage(row, now) {
             insertedMessages.push({
                 id: messageId,
                 content: messageItem.content,
+                preview: getPreviewText(messageItem),
                 type: messageItem.type || 'text',
                 time: messageTime
             });
@@ -813,14 +851,22 @@ async function createOfflineMessage(row, now) {
         attempted: 0
     };
     for (const insertedMessage of insertedMessages) {
+        const notificationTitle = row.name ? String(row.name).trim() : '新消息';
+        const notificationBody = insertedMessage.preview || insertedMessage.content;
+        const avatarUrl = resolvePushAvatarUrl(row);
         const pushResult = await sendPushToUser(row.user_id, {
-            title: row.name ? `${row.name} sent a message` : 'New message',
-            body: insertedMessage.content,
+            title: notificationTitle,
+            body: notificationBody,
+            icon: avatarUrl,
+            badge: avatarUrl,
             tag: `contact-${row.contact_id}-${insertedMessage.id}`,
             contactId: String(row.contact_id),
             url: `./?contactId=${encodeURIComponent(String(row.contact_id))}&openChat=1`,
             data: {
                 contactId: String(row.contact_id),
+                contactName: notificationTitle,
+                icon: avatarUrl,
+                badge: avatarUrl,
                 messageId: insertedMessage.id,
                 url: `./?contactId=${encodeURIComponent(String(row.contact_id))}&openChat=1`
             }
@@ -843,8 +889,13 @@ async function createOfflineMessage(row, now) {
 }
 
 async function runActiveReplyCheck() {
+    if (activeReplyCheckPromise) {
+        return activeReplyCheckPromise;
+    }
+
+    activeReplyCheckPromise = (async () => {
     const rows = db.prepare(`
-        SELECT c.user_id, c.contact_id, c.name, c.persona_prompt, c.context_limit, c.active_reply_enabled, c.active_reply_interval_sec, c.active_reply_start_time, c.last_triggered_msg_id,
+        SELECT c.user_id, c.contact_id, c.name, c.avatar_url, c.persona_prompt, c.context_limit, c.active_reply_enabled, c.active_reply_interval_sec, c.active_reply_start_time, c.last_triggered_msg_id,
                s.message_id, s.role, s.content, s.type, s.time
         FROM contacts c
         LEFT JOIN message_snapshots s ON s.user_id = c.user_id AND s.contact_id = c.contact_id
@@ -870,6 +921,13 @@ async function runActiveReplyCheck() {
     }
 
     return triggered;
+    })();
+
+    try {
+        return await activeReplyCheckPromise;
+    } finally {
+        activeReplyCheckPromise = null;
+    }
 }
 
 app.get('/health', (req, res) => {
@@ -943,14 +1001,20 @@ app.post('/api/prompt-context', (req, res) => {
 app.post('/api/contacts', (req, res) => {
     const body = req.body || {};
     const now = Date.now();
+    const requestedIntervalSec = Number(
+        body.activeReplyIntervalSec !== undefined
+            ? body.activeReplyIntervalSec
+            : body.activeReplyInterval
+    );
     upsertContactStmt.run({
         user_id: body.userId || 'default-user',
         contact_id: String(body.contactId),
         name: body.name || '',
+        avatar_url: String(body.avatarUrl || '').trim(),
         persona_prompt: body.personaPrompt || '',
         context_limit: Math.max(0, Math.round(Number(body.contextLimit || 0))) || 50,
         active_reply_enabled: body.activeReplyEnabled ? 1 : 0,
-        active_reply_interval_sec: Math.max(1, Math.round(Number(body.activeReplyInterval || 1) * 60)),
+        active_reply_interval_sec: Math.max(1, Math.round(Number.isFinite(requestedIntervalSec) ? requestedIntervalSec : 60)),
         active_reply_start_time: Number(body.activeReplyStartTime || 0),
         last_triggered_msg_id: body.lastActiveReplyTriggeredMsgId || null,
         created_at: now,
@@ -981,10 +1045,15 @@ app.post('/api/messages/snapshot', (req, res) => {
     res.json({ ok: true });
 });
 
-app.post('/api/messages/sync', (req, res) => {
+app.post('/api/messages/sync', async (req, res) => {
     const body = req.body || {};
     const userId = body.userId || 'default-user';
     const since = Number(body.since || 0);
+    try {
+        await runActiveReplyCheck();
+    } catch (err) {
+        console.error('[api/messages/sync] pre-sync active reply check failed', err);
+    }
     const messages = db.prepare(`SELECT * FROM messages WHERE user_id = ? AND time > ? ORDER BY time ASC`).all(userId, since).map(serializeMessageRow).filter(Boolean);
     res.json({ messages, serverTime: Date.now() });
 });
@@ -1015,7 +1084,7 @@ app.post('/api/messages/delete', (req, res) => {
 app.post('/api/debug/trigger-active-reply', async (req, res) => {
     const body = req.body || {};
     const row = db.prepare(`
-        SELECT c.user_id, c.contact_id, c.name, c.persona_prompt, c.context_limit, c.active_reply_enabled, c.active_reply_interval_sec, c.active_reply_start_time, c.last_triggered_msg_id,
+        SELECT c.user_id, c.contact_id, c.name, c.avatar_url, c.persona_prompt, c.context_limit, c.active_reply_enabled, c.active_reply_interval_sec, c.active_reply_start_time, c.last_triggered_msg_id,
                s.message_id, s.role, s.content, s.type, s.time
         FROM contacts c
         LEFT JOIN message_snapshots s ON s.user_id = c.user_id AND s.contact_id = c.contact_id
@@ -1044,6 +1113,15 @@ setInterval(async () => {
         console.error('[active-reply-cron] failed', err);
     }
 }, CRON_INTERVAL_MS);
+
+setTimeout(async () => {
+    try {
+        const triggered = await runActiveReplyCheck();
+        console.log(`[active-reply-startup] checked on boot, triggered ${triggered} message(s)`);
+    } catch (err) {
+        console.error('[active-reply-startup] failed', err);
+    }
+}, 1000);
 
 app.listen(PORT, () => {
     console.log(`offline-active-reply server listening on :${PORT}`);
