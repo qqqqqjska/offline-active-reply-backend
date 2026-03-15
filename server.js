@@ -321,6 +321,21 @@ async function generateAiReplyContent(row, minutesPassed) {
     const recentContext = getRecentChatContext(row.user_id, row.contact_id);
     const instruction = buildActiveReplyInstruction(row, minutesPassed);
 
+    try {
+        console.log('[offline-ai] active profile summary', JSON.stringify({
+            userId: row.user_id,
+            contactId: String(row.contact_id),
+            apiUrl: profile ? String(profile.api_url || '').slice(0, 120) : '',
+            model: profile ? String(profile.model || '') : '',
+            temperature: profile ? Number(profile.temperature || 0.7) : null,
+            contextCount: Array.isArray(recentContext) ? recentContext.length : 0,
+            contextLimit: Number(row.context_limit || 50) > 0 ? Number(row.context_limit) : 50,
+            hasApiKey: !!(profile && profile.api_key)
+        }));
+    } catch (profileLogErr) {
+        console.error('[offline-ai] active profile summary logging failed', profileLogErr);
+    }
+
     if (!profile || !profile.api_url || !profile.api_key || !profile.model) {
         return {
             content: fallbackMessage(row.name || '对方', row),
