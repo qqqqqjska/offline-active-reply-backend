@@ -1,8 +1,9 @@
-import express from 'express';
+﻿import express from 'express';
 import cors from 'cors';
 import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
+import webpush from 'web-push';
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -10,9 +11,19 @@ const APP_ORIGIN = process.env.APP_ORIGIN || '*';
 const CRON_INTERVAL_MS = Math.max(10000, Number(process.env.CRON_INTERVAL_MS || 60000));
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), 'data');
 const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, 'offline-active-reply.db');
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || '';
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:you@example.com';
+const PUSH_ENABLED = Boolean(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY && VAPID_SUBJECT);
 
 if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+if (PUSH_ENABLED) {
+    webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+} else {
+    console.warn('[push] disabled: VAPID env vars are incomplete');
 }
 
 const db = new Database(DB_PATH);
@@ -84,16 +95,17 @@ app.use(express.json({ limit: '1mb' }));
 
 function buildActiveReplyPrompt(lastMessage, minutesPassed) {
     if (lastMessage && lastMessage.role === 'user') {
-        return `（系统提示：主动发消息模式触发。距离用户上一条消息已过去 ${minutesPassed} 分钟。请在不打断人设的前提下自然接住对方刚才的话；可以轻描淡写解释回复稍晚，也可以直接顺着话题继续。）`;
+        return `Active reply triggered ${minutesPassed} minute(s) after the user's last message. Reply naturally and stay in persona.`;
     }
-    return `（系统提示：主动发消息模式触发。距离你上一条消息已过去 ${minutesPassed} 分钟，用户一直没有回复。请像真人间隔一阵后自然续聊：可以补一句、换个轻话题，或分享当下状态/见闻；不要写成系统通知或任务播报。）`;
+    return `Active reply triggered ${minutesPassed} minute(s) after silence. Continue the conversation naturally and stay in persona.`;
 }
 
 function fallbackMessage(contactName, lastMessage) {
+    const name = contactName || 'They';
     if (lastMessage && lastMessage.role === 'user') {
-        return `刚刚在忙，现在看到啦。${contactName ? `${contactName}想接着聊聊，` : ''}我在想你刚才那句。`;
+        return `Just saw your last message. ${name} wanted to reply and keep chatting.`;
     }
-    return `${contactName || '对方'}隔了一会儿又来找你：我突然想到一件事，想继续和你说。`;
+    return `${name} came back after a short pause and wanted to continue the conversation.`;
 }
 
 const upsertContactStmt = db.prepare(`
@@ -144,7 +156,102 @@ SET last_triggered_msg_id = ?, last_triggered_at = ?, last_seen_message_id = ?, 
 WHERE user_id = ? AND contact_id = ?
 `);
 
-function runActiveReplyCheck() {
+const deleteSubscriptionByEndpointStmt = db.prepare(`DELETE FROM device_subscriptions WHERE endpoint = ?`);
+const listSubscriptionsByUserStmt = db.prepare(`SELECT subscription_json, endpoint FROM device_subscriptions WHERE user_id = ?`);
+
+function getSubscriptionsByUser(userId) {
+    return listSubscriptionsByUserStmt.all(userId).map((row) => {
+        try {
+            return {
+                endpoint: row.endpoint,
+                subscription: JSON.parse(row.subscription_json)
+            };
+        } catch (err) {
+            return null;
+        }
+    }).filter(Boolean);
+}
+
+async function sendPushToUser(userId, payload) {
+    if (!PUSH_ENABLED) {
+        return { enabled: false, delivered: 0, removed: 0 };
+    }
+
+    const subscriptions = getSubscriptionsByUser(userId);
+    let delivered = 0;
+    let removed = 0;
+
+    for (const item of subscriptions) {
+        try {
+            await webpush.sendNotification(item.subscription, JSON.stringify(payload));
+            delivered += 1;
+        } catch (err) {
+            const statusCode = Number(err && err.statusCode);
+            console.error('[push] send failed', statusCode || '', item.endpoint, err && err.message ? err.message : err);
+            if (statusCode === 404 || statusCode === 410) {
+                try {
+                    deleteSubscriptionByEndpointStmt.run(item.endpoint);
+                    removed += 1;
+                } catch (deleteErr) {
+                    console.error('[push] failed to delete expired subscription', deleteErr);
+                }
+            }
+        }
+    }
+
+    return { enabled: true, delivered, removed };
+}
+
+async function createOfflineMessage(row, now) {
+    const minutesPassed = Math.max(1, Math.floor((now - Number(row.time || now)) / 60000));
+    const prompt = buildActiveReplyPrompt(row, minutesPassed);
+    const content = fallbackMessage(row.name || 'Contact', row);
+    const messageId = `offline-${row.user_id}-${row.contact_id}-${row.message_id}-${now}`;
+
+    const insertResult = insertMessageStmt.run({
+        id: messageId,
+        user_id: row.user_id,
+        contact_id: String(row.contact_id),
+        role: 'assistant',
+        content,
+        type: 'text',
+        description: prompt,
+        time: now,
+        read: 0,
+        source: 'offline-backend'
+    });
+
+    if (!insertResult.changes) {
+        return null;
+    }
+
+    updateTriggerStateStmt.run(messageId, now, row.message_id, now, row.user_id, String(row.contact_id));
+
+    const payload = {
+        title: row.name ? `${row.name} sent a message` : 'New message',
+        body: content,
+        tag: `contact-${row.contact_id}`,
+        contactId: String(row.contact_id),
+        url: `./?contactId=${encodeURIComponent(String(row.contact_id))}&openChat=1`,
+        data: {
+            contactId: String(row.contact_id),
+            messageId,
+            url: `./?contactId=${encodeURIComponent(String(row.contact_id))}&openChat=1`
+        }
+    };
+
+    const push = await sendPushToUser(row.user_id, payload);
+
+    return {
+        id: messageId,
+        contactId: String(row.contact_id),
+        content,
+        time: now,
+        push
+    };
+}
+
+async function runActiveReplyCheck() {
     const rows = db.prepare(`
         SELECT c.user_id, c.contact_id, c.name, c.active_reply_enabled, c.active_reply_interval_sec, c.active_reply_start_time, c.last_triggered_msg_id,
                s.message_id, s.role, s.content, s.type, s.time
@@ -158,37 +265,24 @@ function runActiveReplyCheck() {
 
     for (const row of rows) {
         if (!row.message_id) continue;
-        if (Number(row.active_reply_start_time || 0) && Number(row.time || 0) <= Number(row.active_reply_start_time || 0)) continue;
+        if (Number(row.active_reply_start_time || 0) > now) continue;
         if (row.last_triggered_msg_id && row.last_triggered_msg_id === row.message_id) continue;
-        if (now - Number(row.time || 0) < Number(row.active_reply_interval_sec || 60) * 1000) continue;
 
-        const minutesPassed = Math.max(1, Math.floor((now - Number(row.time || now)) / 60000));
-        const prompt = buildActiveReplyPrompt(row, minutesPassed);
-        const content = fallbackMessage(row.name || '对方', row);
-        const messageId = `offline-${row.user_id}-${row.contact_id}-${row.message_id}`;
+        const elapsedMs = now - Number(row.time || 0);
+        const requiredMs = Math.max(1, Number(row.active_reply_interval_sec || 60)) * 1000;
+        if (elapsedMs < requiredMs) continue;
 
-        insertMessageStmt.run({
-            id: messageId,
-            user_id: row.user_id,
-            contact_id: String(row.contact_id),
-            role: 'assistant',
-            content,
-            type: 'text',
-            description: prompt,
-            time: now,
-            read: 0,
-            source: 'offline-backend'
-        });
-
-        updateTriggerStateStmt.run(messageId, now, row.message_id, now, row.user_id, String(row.contact_id));
-        triggered += 1;
+        const created = await createOfflineMessage(row, now);
+        if (created) {
+            triggered += 1;
+        }
     }
 
     return triggered;
 }
 
 app.get('/health', (req, res) => {
-    res.json({ ok: true, now: Date.now() });
+    res.json({ ok: true, now: Date.now(), pushEnabled: PUSH_ENABLED });
 });
 
 app.post('/api/push/subscribe', (req, res) => {
@@ -207,7 +301,7 @@ app.post('/api/push/subscribe', (req, res) => {
         created_at: now,
         updated_at: now
     });
-    res.json({ ok: true });
+    res.json({ ok: true, pushEnabled: PUSH_ENABLED });
 });
 
 app.post('/api/contacts', (req, res) => {
@@ -268,7 +362,7 @@ app.post('/api/messages/mark-read', (req, res) => {
     res.json({ ok: true });
 });
 
-app.post('/api/debug/trigger-active-reply', (req, res) => {
+app.post('/api/debug/trigger-active-reply', async (req, res) => {
     const body = req.body || {};
     const row = db.prepare(`
         SELECT c.user_id, c.contact_id, c.name, c.active_reply_enabled, c.active_reply_interval_sec, c.active_reply_start_time, c.last_triggered_msg_id,
@@ -282,30 +376,17 @@ app.post('/api/debug/trigger-active-reply', (req, res) => {
         return res.status(404).json({ ok: false, error: 'contact or snapshot not found' });
     }
 
-    const now = Date.now();
-    const minutesPassed = Math.max(1, Math.floor((now - Number(row.time || now)) / 60000));
-    const prompt = buildActiveReplyPrompt(row, minutesPassed);
-    const content = fallbackMessage(row.name || '对方', row);
-    const messageId = `offline-${row.user_id}-${row.contact_id}-${row.message_id}-${now}`;
-    insertMessageStmt.run({
-        id: messageId,
-        user_id: row.user_id,
-        contact_id: String(row.contact_id),
-        role: 'assistant',
-        content,
-        type: 'text',
-        description: prompt,
-        time: now,
-        read: 0,
-        source: 'offline-backend'
-    });
-    updateTriggerStateStmt.run(messageId, now, row.message_id, now, row.user_id, String(row.contact_id));
-    res.json({ ok: true, message: { id: messageId, contactId: row.contact_id, content, time: now }, serverTime: now });
+    const created = await createOfflineMessage(row, Date.now());
+    if (!created) {
+        return res.status(409).json({ ok: false, error: 'message already triggered for current snapshot' });
+    }
+
+    res.json({ ok: true, message: created, serverTime: Date.now() });
 });
 
-setInterval(() => {
+setInterval(async () => {
     try {
-        const triggered = runActiveReplyCheck();
+        const triggered = await runActiveReplyCheck();
         if (triggered > 0) {
             console.log(`[active-reply-cron] triggered ${triggered} message(s)`);
         }
@@ -317,4 +398,5 @@ setInterval(() => {
 app.listen(PORT, () => {
     console.log(`offline-active-reply server listening on :${PORT}`);
     console.log(`db path: ${DB_PATH}`);
+    console.log(`push enabled: ${PUSH_ENABLED}`);
 });
