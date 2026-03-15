@@ -368,6 +368,23 @@ async function generateAiReplyContent(row, minutesPassed) {
         }
 
         const data = await response.json();
+        try {
+            const choice = data && Array.isArray(data.choices) ? data.choices[0] : null;
+            const message = choice && choice.message ? choice.message : null;
+            console.log('[offline-ai] raw response summary', JSON.stringify({
+                hasChoices: !!(data && Array.isArray(data.choices) && data.choices.length),
+                choiceKeys: choice ? Object.keys(choice) : [],
+                messageKeys: message ? Object.keys(message) : [],
+                messageContentType: message ? (Array.isArray(message.content) ? 'array' : typeof message.content) : null,
+                messageContentPreview: extractTextFromAiResponsePart(message ? message.content : null).slice(0, 200),
+                choiceTextPreview: String(choice && choice.text ? choice.text : '').slice(0, 200),
+                deltaContentPreview: extractTextFromAiResponsePart(choice && choice.delta ? choice.delta.content : null).slice(0, 200),
+                outputTextPreview: String(data && data.output_text ? data.output_text : '').slice(0, 200),
+                outputFirstPreview: extractTextFromAiResponsePart(data && Array.isArray(data.output) && data.output[0] ? data.output[0].content : null).slice(0, 200)
+            }));
+        } catch (logErr) {
+            console.error('[offline-ai] raw response summary logging failed', logErr);
+        }
         const extractedReply = extractReplyContentFromAiResponse(data);
         const content = String(extractedReply.content || '').trim();
         if (!content) {
