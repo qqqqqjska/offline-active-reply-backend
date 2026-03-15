@@ -114,6 +114,21 @@ CREATE TABLE IF NOT EXISTS ai_profiles (
   updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS prompt_contexts (
+  user_id TEXT NOT NULL,
+  contact_id TEXT NOT NULL,
+  worldbook_context TEXT NOT NULL DEFAULT '',
+  memory_context TEXT NOT NULL DEFAULT '',
+  important_state_context TEXT NOT NULL DEFAULT '',
+  lookus_context TEXT NOT NULL DEFAULT '',
+  meeting_context TEXT NOT NULL DEFAULT '',
+  time_context TEXT NOT NULL DEFAULT '',
+  calendar_context TEXT NOT NULL DEFAULT '',
+  itinerary_context TEXT NOT NULL DEFAULT '',
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, contact_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_user_time ON messages(user_id, time);
 `);
 
@@ -179,6 +194,27 @@ ON CONFLICT(user_id, contact_id) DO UPDATE SET
   updated_at=excluded.updated_at
 `);
 const getChatContextStmt = db.prepare(`SELECT messages_json FROM chat_contexts WHERE user_id = ? AND contact_id = ?`);
+const upsertPromptContextStmt = db.prepare(`
+INSERT INTO prompt_contexts (
+  user_id, contact_id, worldbook_context, memory_context, important_state_context,
+  lookus_context, meeting_context, time_context, calendar_context, itinerary_context, updated_at
+)
+VALUES (
+  @user_id, @contact_id, @worldbook_context, @memory_context, @important_state_context,
+  @lookus_context, @meeting_context, @time_context, @calendar_context, @itinerary_context, @updated_at
+)
+ON CONFLICT(user_id, contact_id) DO UPDATE SET
+  worldbook_context=excluded.worldbook_context,
+  memory_context=excluded.memory_context,
+  important_state_context=excluded.important_state_context,
+  lookus_context=excluded.lookus_context,
+  meeting_context=excluded.meeting_context,
+  time_context=excluded.time_context,
+  calendar_context=excluded.calendar_context,
+  itinerary_context=excluded.itinerary_context,
+  updated_at=excluded.updated_at
+`);
+const getPromptContextStmt = db.prepare(`SELECT * FROM prompt_contexts WHERE user_id = ? AND contact_id = ?`);
 const upsertAiProfileStmt = db.prepare(`
 INSERT INTO ai_profiles (user_id, api_url, api_key, model, temperature, updated_at)
 VALUES (@user_id, @api_url, @api_key, @model, @temperature, @updated_at)
@@ -196,6 +232,155 @@ function normalizeApiUrl(url) {
     if (!value) return '';
     if (value.endsWith('/chat/completions')) return value;
     return value.endsWith('/') ? `${value}chat/completions` : `${value}/chat/completions`;
+}
+
+function trimWechatPromptSection(section) {
+    return typeof section === 'string' ? section.trim() : '';
+}
+
+function joinWechatPromptSections(sections) {
+    return sections.map(trimWechatPromptSection).filter(Boolean).join('\n\n');
+}
+
+function buildWechatRolePromptLite(row) {
+    const persona = trimWechatPromptSection(row && row.persona_prompt ? String(row.persona_prompt) : '无');
+    return joinWechatPromptSections([
+        `你现在扮演 ${row.name || '联系人'}。`,
+        `【角色与优先级】\n- 最高优先级：严格遵守以下人设\n${persona}\n- 聊天风格：正常`,
+        `你必须完全沉浸在角色中，绝不能透露你是AI或语言模型。你的回复必须像真实的${row.name || '联系人'}在微信里聊天。`,
+        '如果回复涉及状态记忆，必须严格区分“用户状态”和“联系人状态”，不要混淆主体。'
+    ]);
+}
+
+function buildWechatProtocolPromptLite() {
+    return [
+        '【输出协议】',
+        '- 你必须且只能返回一个标准 JSON 数组。',
+        '- 严禁输出 Markdown 代码块，严禁在 JSON 数组之外输出任何文本。',
+        '- 严禁把控制信息写进可见正文，例如 [引用回复: ...]、(内心独白: ...)、ACTION: ...。',
+        '- 允许的 type 只有：thought_state、text_message、sticker_message、quote_reply、image、voice、action。',
+        '- text_message：{"type":"text_message","content":"单条可见消息正文"}。',
+        '- 如果你只想发一句普通消息，请直接返回如：[{"type":"text_message","content":"我刚刚在忙，现在回你。"}]。',
+        '- 不要只返回 role，不要返回空 content。'
+    ].join('\n');
+}
+
+function buildWechatHumanFeelPromptLite() {
+    return [
+        '【活人感】',
+        '- 像真实微信聊天，不像客服、机器人或任务执行器。',
+        '- 说话自然口语化，顺着上下文接话；不要写成说明文、规则复读或系统播报。',
+        '- 只输出这次真正要发给对方的话。',
+        '- 当前离线主动消息以自然文字回复为第一优先级。'
+    ].join('\n');
+}
+
+function buildWechatBaseCapabilityPromptLite() {
+    return [
+        '【常驻能力】',
+        '- 你当前只需要优先完成聊天回复。',
+        '- 如无必要，不要输出 action。',
+        '- 如果能直接用自然文字说清楚，就不要复杂化。'
+    ].join('\n');
+}
+
+function buildBackendWechatSystemPrompt(row, activeInstruction) {
+    const promptContext = getPromptContextStmt.get(row.user_id, String(row.contact_id)) || {};
+    return joinWechatPromptSections([
+        buildWechatRolePromptLite(row),
+        buildWechatProtocolPromptLite(),
+        buildWechatHumanFeelPromptLite(),
+        buildWechatBaseCapabilityPromptLite(),
+        promptContext.important_state_context || '',
+        promptContext.lookus_context || '',
+        promptContext.memory_context || '',
+        promptContext.meeting_context || '',
+        promptContext.worldbook_context || '',
+        promptContext.time_context || '',
+        promptContext.calendar_context || '',
+        promptContext.itinerary_context || '',
+        `【回复指令】\n${trimWechatPromptSection(activeInstruction)}`
+    ]);
+}
+
+function convertContextMessagesForWechatPrompt(recentContext, limit) {
+    const source = Array.isArray(recentContext) ? recentContext.slice(-(limit > 0 ? limit : 50)) : [];
+    return source
+        .filter(item => item && typeof item.content === 'string' && item.content.trim())
+        .map(item => ({
+            role: item.role === 'user' ? 'user' : 'assistant',
+            content: String(item.content || '').trim()
+        }));
+}
+
+function extractVisibleTextFromMixedResponse(rawText) {
+    const text = String(rawText || '').trim();
+    if (!text) return '';
+
+    try {
+        const parsed = JSON.parse(text);
+        const items = Array.isArray(parsed) ? parsed : [parsed];
+        const visibleTexts = [];
+        items.forEach((item) => {
+            if (!item || typeof item !== 'object') return;
+            if (item.type === 'text_message' && typeof item.content === 'string' && item.content.trim()) {
+                visibleTexts.push(item.content.trim());
+            }
+            if (item.type === 'quote_reply' && typeof item.reply_content === 'string' && item.reply_content.trim()) {
+                visibleTexts.push(item.reply_content.trim());
+            }
+            if (item.type === 'sticker_message' && typeof item.sticker === 'string' && item.sticker.trim()) {
+                visibleTexts.push(`[表情包] ${item.sticker.trim()}`);
+            }
+            if (item.type === 'image' && typeof item.content === 'string' && item.content.trim()) {
+                visibleTexts.push(item.content.trim());
+            }
+            if (item.type === 'voice' && typeof item.content === 'string' && item.content.trim()) {
+                visibleTexts.push(item.content.trim());
+            }
+        });
+        if (visibleTexts.length > 0) {
+            return visibleTexts.join('\n');
+        }
+    } catch (err) {}
+
+    return text;
+}
+
+function extractVisibleMessagesFromMixedResponse(rawText) {
+    const text = String(rawText || '').trim();
+    if (!text) return [];
+
+    try {
+        const parsed = JSON.parse(text);
+        const items = Array.isArray(parsed) ? parsed : [parsed];
+        const visibleMessages = [];
+        items.forEach((item) => {
+            if (!item || typeof item !== 'object') return;
+            if (item.type === 'text_message' && typeof item.content === 'string' && item.content.trim()) {
+                visibleMessages.push({ type: 'text', content: item.content.trim() });
+                return;
+            }
+            if (item.type === 'quote_reply' && typeof item.reply_content === 'string' && item.reply_content.trim()) {
+                visibleMessages.push({ type: 'text', content: item.reply_content.trim() });
+                return;
+            }
+            if (item.type === 'sticker_message' && typeof item.sticker === 'string' && item.sticker.trim()) {
+                visibleMessages.push({ type: 'text', content: `[表情包] ${item.sticker.trim()}` });
+                return;
+            }
+            if (item.type === 'image' && typeof item.content === 'string' && item.content.trim()) {
+                visibleMessages.push({ type: 'text', content: item.content.trim() });
+                return;
+            }
+            if (item.type === 'voice' && typeof item.content === 'string' && item.content.trim()) {
+                visibleMessages.push({ type: 'text', content: item.content.trim() });
+            }
+        });
+        return visibleMessages;
+    } catch (err) {
+        return text ? [{ type: 'text', content: text }] : [];
+    }
 }
 
 function extractTextFromAiResponsePart(part) {
@@ -344,24 +529,12 @@ async function generateAiReplyContent(row, minutesPassed) {
         };
     }
 
-    const messages = [];
-    const personaPrompt = String(row.persona_prompt || '').trim();
-    const systemSections = [
-        `你正在扮演聊天联系人「${row.name || '联系人'}」。`,
-        personaPrompt ? `【人设】\n${personaPrompt}` : '',
-        '【回复要求】\n- 用聊天口吻自然回复。\n- 不要提到自己是 AI、系统、脚本。\n- 不要写成通知文案。\n- 只输出用户可见的回复正文。'
-    ].filter(Boolean);
-
-    messages.push({ role: 'system', content: systemSections.join('\n\n') });
-
     const contextLimit = Number(row.context_limit || 50) > 0 ? Number(row.context_limit) : 50;
-    const trimmedContext = recentContext.slice(-contextLimit).map((message) => ({
-        role: message && message.role === 'user' ? 'user' : 'assistant',
-        content: String(message && message.content ? message.content : '').slice(0, 1200)
-    })).filter((item) => item.content);
-
-    messages.push(...trimmedContext);
-    messages.push({ role: 'system', content: instruction });
+    const systemPrompt = buildBackendWechatSystemPrompt(row, instruction);
+    const messages = [
+        { role: 'system', content: systemPrompt },
+        ...convertContextMessagesForWechatPrompt(recentContext, contextLimit)
+    ];
 
     try {
         const response = await fetch(normalizeApiUrl(profile.api_url), {
@@ -407,7 +580,7 @@ async function generateAiReplyContent(row, minutesPassed) {
         }
 
         return {
-            content: content.replace(/<thinking>[\s\S]*?<\/thinking>/g, '').replace(/<think>[\s\S]*?<\/think>/g, '').trim() || fallbackMessage(row.name || '对方', row),
+            content: extractVisibleTextFromMixedResponse(content).replace(/<thinking>[\s\S]*?<\/thinking>/g, '').replace(/<think>[\s\S]*?<\/think>/g, '').trim() || fallbackMessage(row.name || '对方', row),
             usedFallback: false,
             debug: extractedReply.source || 'ai_generated'
         };
@@ -425,37 +598,58 @@ async function createOfflineMessage(row, now) {
     const minutesPassed = Math.max(1, Math.floor((now - Number(row.time || now)) / 60000));
     const generated = await generateAiReplyContent(row, minutesPassed);
     const prompt = buildActiveReplyInstruction(row, minutesPassed);
-    const content = generated.content;
-    const messageId = `offline-${row.user_id}-${row.contact_id}-${row.message_id}-${now}`;
+    const visibleMessages = extractVisibleMessagesFromMixedResponse(generated.content)
+        .map((item) => ({
+            type: item.type || 'text',
+            content: String(item.content || '').trim()
+        }))
+        .filter((item) => item.content);
+    const normalizedMessages = visibleMessages.length > 0
+        ? visibleMessages
+        : [{ type: 'text', content: fallbackMessage(row.name || '对方', row) }];
 
-    const insertResult = insertMessageStmt.run({
-        id: messageId,
-        user_id: row.user_id,
-        contact_id: String(row.contact_id),
-        role: 'assistant',
-        content,
-        type: 'text',
-        description: prompt,
-        time: now,
-        read: 0,
-        source: 'offline-backend'
+    let insertedCount = 0;
+    let firstMessageId = null;
+    let firstContent = normalizedMessages[0].content;
+
+    normalizedMessages.forEach((messageItem, index) => {
+        const messageTime = now + index;
+        const messageId = `offline-${row.user_id}-${row.contact_id}-${row.message_id}-${messageTime}-${index}`;
+        const insertResult = insertMessageStmt.run({
+            id: messageId,
+            user_id: row.user_id,
+            contact_id: String(row.contact_id),
+            role: 'assistant',
+            content: messageItem.content,
+            type: messageItem.type || 'text',
+            description: prompt,
+            time: messageTime,
+            read: 0,
+            source: 'offline-backend'
+        });
+        if (insertResult.changes) {
+            insertedCount += 1;
+            if (!firstMessageId) {
+                firstMessageId = messageId;
+            }
+        }
     });
 
-    if (!insertResult.changes) {
+    if (!insertedCount || !firstMessageId) {
         return null;
     }
 
-    updateTriggerStateStmt.run(messageId, now, row.message_id, now, row.user_id, String(row.contact_id));
+    updateTriggerStateStmt.run(firstMessageId, now, row.message_id, now, row.user_id, String(row.contact_id));
 
     const payload = {
         title: row.name ? `${row.name} sent a message` : 'New message',
-        body: content,
+        body: firstContent,
         tag: `contact-${row.contact_id}`,
         contactId: String(row.contact_id),
         url: `./?contactId=${encodeURIComponent(String(row.contact_id))}&openChat=1`,
         data: {
             contactId: String(row.contact_id),
-            messageId,
+            messageId: firstMessageId,
             url: `./?contactId=${encodeURIComponent(String(row.contact_id))}&openChat=1`
         }
     };
@@ -463,11 +657,12 @@ async function createOfflineMessage(row, now) {
     const push = await sendPushToUser(row.user_id, payload);
 
     return {
-        id: messageId,
+        id: firstMessageId,
         contactId: String(row.contact_id),
-        content,
+        content: firstContent,
         time: now,
         push,
+        messageCount: insertedCount,
         usedFallback: generated.usedFallback,
         debug: generated.debug
     };
@@ -551,6 +746,24 @@ app.post('/api/chat-context', (req, res) => {
         updated_at: Date.now()
     });
     res.json({ ok: true, count: messages.length });
+});
+
+app.post('/api/prompt-context', (req, res) => {
+    const body = req.body || {};
+    upsertPromptContextStmt.run({
+        user_id: body.userId || 'default-user',
+        contact_id: String(body.contactId),
+        worldbook_context: String(body.worldbookContext || ''),
+        memory_context: String(body.memoryContext || ''),
+        important_state_context: String(body.importantStateContext || ''),
+        lookus_context: String(body.lookusContext || ''),
+        meeting_context: String(body.meetingContext || ''),
+        time_context: String(body.timeContext || ''),
+        calendar_context: String(body.calendarContext || ''),
+        itinerary_context: String(body.itineraryContext || ''),
+        updated_at: Date.now()
+    });
+    res.json({ ok: true });
 });
 
 app.post('/api/contacts', (req, res) => {
