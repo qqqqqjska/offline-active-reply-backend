@@ -351,6 +351,16 @@ function extractVisibleMessagesFromMixedResponse(rawText) {
     const text = String(rawText || '').trim();
     if (!text) return [];
 
+    const splitPlainTextMessages = (value) => {
+        const normalized = String(value || '').replace(/\r\n?/g, '\n').trim();
+        if (!normalized) return [];
+        const lines = normalized.split('\n').map((line) => line.trim()).filter(Boolean);
+        if (lines.length <= 1) {
+            return normalized ? [{ type: 'text', content: normalized }] : [];
+        }
+        return lines.map((line) => ({ type: 'text', content: line }));
+    };
+
     try {
         const parsed = JSON.parse(text);
         const items = Array.isArray(parsed) ? parsed : [parsed];
@@ -358,11 +368,11 @@ function extractVisibleMessagesFromMixedResponse(rawText) {
         items.forEach((item) => {
             if (!item || typeof item !== 'object') return;
             if (item.type === 'text_message' && typeof item.content === 'string' && item.content.trim()) {
-                visibleMessages.push({ type: 'text', content: item.content.trim() });
+                visibleMessages.push(...splitPlainTextMessages(item.content));
                 return;
             }
             if (item.type === 'quote_reply' && typeof item.reply_content === 'string' && item.reply_content.trim()) {
-                visibleMessages.push({ type: 'text', content: item.reply_content.trim() });
+                visibleMessages.push(...splitPlainTextMessages(item.reply_content));
                 return;
             }
             if (item.type === 'sticker_message' && typeof item.sticker === 'string' && item.sticker.trim()) {
@@ -370,16 +380,16 @@ function extractVisibleMessagesFromMixedResponse(rawText) {
                 return;
             }
             if (item.type === 'image' && typeof item.content === 'string' && item.content.trim()) {
-                visibleMessages.push({ type: 'text', content: item.content.trim() });
+                visibleMessages.push(...splitPlainTextMessages(item.content));
                 return;
             }
             if (item.type === 'voice' && typeof item.content === 'string' && item.content.trim()) {
-                visibleMessages.push({ type: 'text', content: item.content.trim() });
+                visibleMessages.push(...splitPlainTextMessages(item.content));
             }
         });
         return visibleMessages;
     } catch (err) {
-        return text ? [{ type: 'text', content: text }] : [];
+        return splitPlainTextMessages(text);
     }
 }
 
