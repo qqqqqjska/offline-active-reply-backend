@@ -505,6 +505,7 @@ async function generateAiReplyContent(row, minutesPassed) {
     const profile = getAiProfile(row.user_id);
     const recentContext = getRecentChatContext(row.user_id, row.contact_id);
     const instruction = buildActiveReplyInstruction(row, minutesPassed);
+    const cleanApiKey = String(profile && profile.api_key ? profile.api_key : '').replace(/[^\x00-\x7F]/g, '').trim();
 
     try {
         console.log('[offline-ai] active profile summary', JSON.stringify({
@@ -521,7 +522,7 @@ async function generateAiReplyContent(row, minutesPassed) {
         console.error('[offline-ai] active profile summary logging failed', profileLogErr);
     }
 
-    if (!profile || !profile.api_url || !profile.api_key || !profile.model) {
+    if (!profile || !profile.api_url || !cleanApiKey || !profile.model) {
         return {
             content: fallbackMessage(row.name || '对方', row),
             usedFallback: true,
@@ -531,9 +532,18 @@ async function generateAiReplyContent(row, minutesPassed) {
 
     const contextLimit = Number(row.context_limit || 50) > 0 ? Number(row.context_limit) : 50;
     const systemPrompt = buildBackendWechatSystemPrompt(row, instruction);
+    const contextMessages = convertContextMessagesForWechatPrompt(recentContext, contextLimit);
+    const lastContextMessage = contextMessages.length ? contextMessages[contextMessages.length - 1] : null;
+    const trailingInstruction = [
+        `[系统提示]: ${instruction}`,
+        lastContextMessage && lastContextMessage.role === 'assistant'
+            ? '当前聊天记录最后一条是你刚刚发出的消息。请把这次生成当作“隔了一会儿后的下一条主动续聊消息”，自然延续话题，不要重复上一条。'
+            : '请紧接着当前聊天记录继续微信聊天，并严格按 JSON 数组协议输出这次真正要发出的消息。'
+    ].join('\n');
     const messages = [
         { role: 'system', content: systemPrompt },
-        ...convertContextMessagesForWechatPrompt(recentContext, contextLimit)
+        ...contextMessages,
+        { role: 'system', content: trailingInstruction }
     ];
 
     try {
@@ -544,6 +554,9 @@ async function generateAiReplyContent(row, minutesPassed) {
             contextMessageCount: Math.max(0, messages.length - 1),
             systemPromptLength: systemPrompt.length,
             systemPromptPreview: systemPrompt.slice(0, 500),
+            tailRoles: messages.slice(-5).map((item) => item.role),
+            lastContextRole: lastContextMessage ? lastContextMessage.role : null,
+            trailingInstructionPreview: trailingInstruction.slice(0, 240),
             recentMessagePreview: messages.slice(-3).map((item) => ({
                 role: item.role,
                 contentPreview: String(item.content || '').slice(0, 160)
@@ -558,7 +571,7 @@ async function generateAiReplyContent(row, minutesPassed) {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'Authorization': `Bearer ${String(profile.api_key || '').trim()}`
+                'Authorization': `Bearer ${cleanApiKey}`
             },
             body: JSON.stringify({
                 model: profile.model,
@@ -579,6 +592,7 @@ async function generateAiReplyContent(row, minutesPassed) {
             console.log('[offline-ai] raw response summary', JSON.stringify({
                 hasChoices: !!(data && Array.isArray(data.choices) && data.choices.length),
                 choiceKeys: choice ? Object.keys(choice) : [],
+                finishReason: choice && choice.finish_reason ? choice.finish_reason : null,
                 messageKeys: message ? Object.keys(message) : [],
                 messageContentType: message ? (Array.isArray(message.content) ? 'array' : typeof message.content) : null,
                 messageContentPreview: extractTextFromAiResponsePart(message ? message.content : null).slice(0, 200),
