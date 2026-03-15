@@ -198,6 +198,51 @@ function normalizeApiUrl(url) {
     return value.endsWith('/') ? `${value}chat/completions` : `${value}/chat/completions`;
 }
 
+function extractTextFromAiResponsePart(part) {
+    if (part === null || part === undefined) return '';
+    if (typeof part === 'string') return part;
+
+    if (Array.isArray(part)) {
+        return part.map((item) => extractTextFromAiResponsePart(item)).filter(Boolean).join('\n');
+    }
+
+    if (typeof part !== 'object') return '';
+
+    if (typeof part.text === 'string') return part.text;
+    if (part.text && typeof part.text.value === 'string') return part.text.value;
+    if (typeof part.value === 'string') return part.value;
+    if (typeof part.content === 'string') return part.content;
+    if (typeof part.output_text === 'string') return part.output_text;
+
+    if (Array.isArray(part.content)) {
+        return part.content.map((item) => extractTextFromAiResponsePart(item)).filter(Boolean).join('\n');
+    }
+
+    return '';
+}
+
+function extractReplyContentFromAiResponse(data) {
+    const choice = data && Array.isArray(data.choices) ? data.choices[0] : null;
+    const message = choice && choice.message ? choice.message : null;
+
+    const candidates = [
+        { source: 'choices[0].message.content', value: message ? message.content : null },
+        { source: 'choices[0].text', value: choice ? choice.text : null },
+        { source: 'choices[0].delta.content', value: choice && choice.delta ? choice.delta.content : null },
+        { source: 'output_text', value: data ? data.output_text : null },
+        { source: 'output[0].content', value: data && Array.isArray(data.output) && data.output[0] ? data.output[0].content : null }
+    ];
+
+    for (const candidate of candidates) {
+        const text = extractTextFromAiResponsePart(candidate.value).trim();
+        if (text) {
+            return { content: text, source: candidate.source };
+        }
+    }
+
+    return { content: '', source: null };
+}
+
 function buildActiveReplyInstruction(lastMessage, minutesPassed) {
     if (lastMessage && lastMessage.role === 'user') {
         return `（系统提示：主动发消息模式触发。距离用户上一条消息已过去 ${minutesPassed} 分钟。请在不打断人设的前提下自然接住对方刚才的话；可以轻描淡写解释回复稍晚，也可以直接顺着话题继续。）`;
@@ -323,7 +368,8 @@ async function generateAiReplyContent(row, minutesPassed) {
         }
 
         const data = await response.json();
-        const content = String(data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content || '').trim();
+        const extractedReply = extractReplyContentFromAiResponse(data);
+        const content = String(extractedReply.content || '').trim();
         if (!content) {
             throw new Error('empty ai reply');
         }
@@ -331,7 +377,7 @@ async function generateAiReplyContent(row, minutesPassed) {
         return {
             content: content.replace(/<thinking>[\s\S]*?<\/thinking>/g, '').replace(/<think>[\s\S]*?<\/think>/g, '').trim() || fallbackMessage(row.name || '对方', row),
             usedFallback: false,
-            debug: 'ai_generated'
+            debug: extractedReply.source || 'ai_generated'
         };
     } catch (err) {
         console.error('[offline-ai] generateAiReplyContent failed', err);
@@ -465,10 +511,11 @@ app.post('/api/ai-profile', (req, res) => {
 app.post('/api/chat-context', (req, res) => {
     const body = req.body || {};
     const messages = Array.isArray(body.messages) ? body.messages : [];
+    const contextLimit = Number(body.contextLimit || 0) > 0 ? Number(body.contextLimit) : 50;
     upsertChatContextStmt.run({
         user_id: body.userId || 'default-user',
         contact_id: String(body.contactId),
-        messages_json: JSON.stringify(messages.slice(-20)),
+        messages_json: JSON.stringify(messages.slice(-contextLimit)),
         updated_at: Date.now()
     });
     res.json({ ok: true, count: messages.length });
