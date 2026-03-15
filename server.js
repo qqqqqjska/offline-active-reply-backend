@@ -313,13 +313,100 @@ function convertContextMessagesForWechatPrompt(recentContext, limit) {
         }));
 }
 
+function extractJsonBlocksFromText(text) {
+    const source = String(text || '');
+    const found = [];
+    const stack = [];
+    let inString = false;
+    let escape = false;
+    let blockStart = -1;
+
+    for (let i = 0; i < source.length; i++) {
+        const char = source[i];
+        if (inString) {
+            if (char === '\\' && !escape) {
+                escape = true;
+            } else if (char === '"' && !escape) {
+                inString = false;
+            } else {
+                escape = false;
+            }
+            continue;
+        }
+
+        if (char === '"') {
+            inString = true;
+            escape = false;
+            continue;
+        }
+
+        if (char === '{' || char === '[') {
+            if (stack.length === 0) blockStart = i;
+            stack.push(char);
+            continue;
+        }
+
+        if (char === '}' || char === ']') {
+            if (!stack.length) continue;
+            const expected = char === '}' ? '{' : '[';
+            if (stack[stack.length - 1] !== expected) {
+                stack.length = 0;
+                blockStart = -1;
+                continue;
+            }
+            stack.pop();
+            if (stack.length === 0 && blockStart >= 0) {
+                found.push(source.slice(blockStart, i + 1));
+                blockStart = -1;
+            }
+        }
+    }
+
+    return found;
+}
+
+function parseVisibleItemsFromMixedResponse(rawText) {
+    const source = String(rawText || '').trim();
+    if (!source) return null;
+
+    const candidates = [];
+    const seen = new Set();
+    const pushCandidate = (value) => {
+        const candidate = String(value || '').trim();
+        if (!candidate || seen.has(candidate)) return;
+        seen.add(candidate);
+        candidates.push(candidate);
+    };
+
+    pushCandidate(source);
+
+    const fencedJsonRegex = /```(?:json)?\s*([\s\S]*?)```/gi;
+    let fencedMatch;
+    while ((fencedMatch = fencedJsonRegex.exec(source)) !== null) {
+        pushCandidate(fencedMatch[1]);
+    }
+
+    extractJsonBlocksFromText(source).forEach(pushCandidate);
+
+    for (const candidate of candidates) {
+        try {
+            const parsed = JSON.parse(candidate);
+            const items = Array.isArray(parsed) ? parsed : [parsed];
+            if (items.some((item) => item && typeof item === 'object')) {
+                return items;
+            }
+        } catch (err) {}
+    }
+
+    return null;
+}
+
 function extractVisibleTextFromMixedResponse(rawText) {
     const text = String(rawText || '').trim();
     if (!text) return '';
 
-    try {
-        const parsed = JSON.parse(text);
-        const items = Array.isArray(parsed) ? parsed : [parsed];
+    const items = parseVisibleItemsFromMixedResponse(text);
+    if (items) {
         const visibleTexts = [];
         items.forEach((item) => {
             if (!item || typeof item !== 'object') return;
@@ -342,7 +429,7 @@ function extractVisibleTextFromMixedResponse(rawText) {
         if (visibleTexts.length > 0) {
             return visibleTexts.join('\n');
         }
-    } catch (err) {}
+    }
 
     return text;
 }
@@ -352,7 +439,11 @@ function extractVisibleMessagesFromMixedResponse(rawText) {
     if (!text) return [];
 
     const splitPlainTextMessages = (value) => {
-        const normalized = String(value || '').replace(/\r\n?/g, '\n').trim();
+        const normalized = String(value || '')
+            .replace(/\r\n?/g, '\n')
+            .replace(/^```(?:json)?\s*/i, '')
+            .replace(/\s*```$/i, '')
+            .trim();
         if (!normalized) return [];
         const lines = normalized.split('\n').map((line) => line.trim()).filter(Boolean);
         if (lines.length <= 1) {
@@ -361,9 +452,8 @@ function extractVisibleMessagesFromMixedResponse(rawText) {
         return lines.map((line) => ({ type: 'text', content: line }));
     };
 
-    try {
-        const parsed = JSON.parse(text);
-        const items = Array.isArray(parsed) ? parsed : [parsed];
+    const items = parseVisibleItemsFromMixedResponse(text);
+    if (items) {
         const visibleMessages = [];
         items.forEach((item) => {
             if (!item || typeof item !== 'object') return;
@@ -388,9 +478,9 @@ function extractVisibleMessagesFromMixedResponse(rawText) {
             }
         });
         return visibleMessages;
-    } catch (err) {
-        return splitPlainTextMessages(text);
     }
+
+    return splitPlainTextMessages(text);
 }
 
 function extractTextFromAiResponsePart(part) {
@@ -907,6 +997,19 @@ app.post('/api/messages/mark-read', (req, res) => {
         db.prepare(`UPDATE messages SET read = 1 WHERE user_id = ? AND id IN (${placeholders})`).run(body.userId || 'default-user', ...ids);
     }
     res.json({ ok: true });
+});
+
+app.post('/api/messages/delete', (req, res) => {
+    const body = req.body || {};
+    const ids = Array.isArray(body.messageIds)
+        ? body.messageIds.map((item) => String(item || '').trim()).filter(Boolean)
+        : [];
+    if (!ids.length) {
+        return res.json({ ok: true, deleted: 0, skipped: true });
+    }
+    const placeholders = ids.map(() => '?').join(',');
+    const result = db.prepare(`DELETE FROM messages WHERE user_id = ? AND id IN (${placeholders})`).run(body.userId || 'default-user', ...ids);
+    res.json({ ok: true, deleted: Number(result && result.changes || 0) });
 });
 
 app.post('/api/debug/trigger-active-reply', async (req, res) => {
