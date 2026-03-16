@@ -604,6 +604,19 @@ function resolvePushAvatarUrl(row) {
     return `https://api.dicebear.com/7.x/avataaars/svg?seed=${seed}`;
 }
 
+function isLikelyImagePreviewUrl(value) {
+    const text = String(value || '').trim();
+    if (!text || !/^https?:\/\//i.test(text)) return false;
+    if (/\.(?:png|jpe?g|gif|webp|bmp|svg|avif)(?:[?#].*)?$/i.test(text)) return true;
+    return /(postimg\.cc|postimg\.org|placehold\.co|imgur\.com|image\.bdstatic\.com|qpic\.cn|alicdn\.com)/i.test(text);
+}
+
+function isLikelyAnimatedPreviewUrl(value) {
+    const text = String(value || '').trim();
+    if (!text) return false;
+    return /\.(?:gif)(?:[?#].*)?$/i.test(text) || /(?:[?&](?:format|type)=gif\b)/i.test(text);
+}
+
 function extractCronSecretFromRequest(req) {
     const headerSecret = String(req.get('x-cron-secret') || req.get('x-offline-cron-secret') || '').trim();
     if (headerSecret) return headerSecret;
@@ -719,6 +732,7 @@ async function generateAiReplyContent(row, minutesPassed, triggerMode) {
     if (!profile || !profile.api_url || !cleanApiKey || !profile.model) {
         return {
             content: fallbackMessage(row.name || '对方', row, triggerMode),
+            rawContent: fallbackMessage(row && row.name, row, triggerMode),
             usedFallback: true,
             debug: 'missing_ai_profile'
         };
@@ -758,12 +772,17 @@ async function generateAiReplyContent(row, minutesPassed, triggerMode) {
         if (!content) {
             throw new Error('empty ai reply');
         }
+        const rawContent = content
+            .replace(/<thinking>[\s\S]*?<\/thinking>/g, '')
+            .replace(/<think>[\s\S]*?<\/think>/g, '')
+            .trim();
 
         return {
             content: extractVisibleTextFromMixedResponse(content)
                 .replace(/<thinking>[\s\S]*?<\/thinking>/g, '')
                 .replace(/<think>[\s\S]*?<\/think>/g, '')
                 .trim() || fallbackMessage(row.name || '对方', row, triggerMode),
+            rawContent: rawContent || content,
             usedFallback: false,
             debug: extractedReply.source || 'ai_generated'
         };
@@ -771,6 +790,7 @@ async function generateAiReplyContent(row, minutesPassed, triggerMode) {
         console.error('[offline-ai] generateAiReplyContent failed', err);
         return {
             content: fallbackMessage(row.name || '对方', row, triggerMode),
+            rawContent: fallbackMessage(row && row.name, row, triggerMode),
             usedFallback: true,
             debug: err && err.message ? err.message : 'ai_error'
         };
@@ -791,7 +811,10 @@ async function createOfflineMessage(row, now, options = {}) {
     };
     const generated = await generateAiReplyContent(rowForGeneration, minutesPassed, triggerMode);
     const prompt = buildActiveReplyInstruction(rowForGeneration, minutesPassed, triggerMode);
-    const visibleMessages = extractVisibleMessagesFromMixedResponse(generated.content)
+    const sourceContentForSplit = typeof generated.rawContent === 'string' && generated.rawContent.trim()
+        ? generated.rawContent
+        : generated.content;
+    const visibleMessages = extractVisibleMessagesFromMixedResponse(sourceContentForSplit)
         .map((item) => ({
             type: item.type || 'text',
             content: String(item.content || '').trim(),
@@ -804,6 +827,21 @@ async function createOfflineMessage(row, now, options = {}) {
 
     const getPreviewText = (messageItem) => {
         if (!messageItem || typeof messageItem !== 'object') return '';
+        if (messageItem.type === 'sticker') {
+            return '[动画表情]';
+        }
+        if (messageItem.type === 'image' || messageItem.type === 'virtual_image') {
+            return isLikelyAnimatedPreviewUrl(messageItem.content) ? '[动画表情]' : '[图片]';
+        }
+        if (messageItem.type === 'voice') {
+            return '[语音]';
+        }
+        if (isLikelyAnimatedPreviewUrl(messageItem.content) || isLikelyAnimatedPreviewUrl(messageItem.description)) {
+            return '[动画表情]';
+        }
+        if (isLikelyImagePreviewUrl(messageItem.content)) {
+            return '[图片]';
+        }
         if (messageItem.type === 'sticker') {
             return `[表情包] ${messageItem.description || messageItem.content || ''}`.trim();
         }
@@ -840,10 +878,15 @@ async function createOfflineMessage(row, now, options = {}) {
             insertedCount += 1;
             insertedMessages.push({
                 id: messageId,
+                contactId: String(row.contact_id),
+                role: 'assistant',
                 content: messageItem.content,
                 preview: getPreviewText(messageItem),
                 type: messageItem.type || 'text',
-                time: messageTime
+                description: messageItem.description || prompt,
+                time: messageTime,
+                read: false,
+                source: 'offline-backend'
             });
             if (!firstMessageId) {
                 firstMessageId = messageId;
@@ -871,6 +914,8 @@ async function createOfflineMessage(row, now, options = {}) {
             title: notificationTitle,
             body: notificationBody,
             icon: avatarUrl,
+            avatarUrl,
+            contactAvatar: avatarUrl,
             badge: avatarUrl,
             tag: `contact-${row.contact_id}-${insertedMessage.id}`,
             contactId: String(row.contact_id),
@@ -879,8 +924,21 @@ async function createOfflineMessage(row, now, options = {}) {
                 contactId: String(row.contact_id),
                 contactName: notificationTitle,
                 icon: avatarUrl,
+                avatarUrl,
+                contactAvatar: avatarUrl,
                 badge: avatarUrl,
                 messageId: insertedMessage.id,
+                message: {
+                    id: insertedMessage.id,
+                    contactId: insertedMessage.contactId,
+                    role: insertedMessage.role,
+                    content: insertedMessage.content,
+                    type: insertedMessage.type,
+                    description: insertedMessage.description,
+                    time: insertedMessage.time,
+                    read: insertedMessage.read,
+                    source: insertedMessage.source
+                },
                 url: `./?contactId=${encodeURIComponent(String(row.contact_id))}&openChat=1`
             }
         });
