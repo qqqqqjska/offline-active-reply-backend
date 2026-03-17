@@ -1,4 +1,4 @@
-﻿import express from 'express';
+import express from 'express';
 import cors from 'cors';
 import Database from 'better-sqlite3';
 import path from 'path';
@@ -30,6 +30,7 @@ if (!vapidPublicKey || !vapidPrivateKey) {
 
 const PUSH_ENABLED = Boolean(vapidPublicKey && vapidPrivateKey && vapidSubject);
 let activeReplyCheckPromise = null;
+const CONTACT_REST_OFFLINE_REGEX = /(晚安|先睡了|睡了|去睡|去睡觉|睡觉了|先休息|休息了|我先下了|先下了|下线|离线|回头聊)/;
 
 if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -318,20 +319,20 @@ function buildWechatProtocolPromptLite() {
 
 function buildWechatHumanFeelPromptLite() {
     return [
-        '銆愯亰澶╂劅瑙夈€?,
-        '- 鍍忕湡瀹炲井淇¤亰澶╋紝涓嶈鍍忔満鍣ㄤ汉銆?,
-        '- 璇皵鑷劧銆佽交鏉俱€佽创杩戞棩甯搞€?,
-        '- 椤虹潃涓婁笅鏂囨帴璇濓紝涓嶈鍐欐垚鍏憡鎴栬鏄庛€?,
-        '- 涓诲姩娑堟伅涔熻鍍忕湡浜烘兂璧峰鏂瑰悗鑷劧鍙戝嚭銆?
+        '【聊天感觉】',
+        '- 像真实微信聊天，不要像机器人。',
+        '- 语气自然、轻松、贴近日常。',
+        '- 顺着上下文接话，不要写成公告或说明。',
+        '- 主动消息也要像真人想到对方后自然发出。'
     ].join('\n');
 }
 
 function buildWechatBaseCapabilityPromptLite() {
     return [
-        '銆愰粯璁ょ瓥鐣ャ€?,
-        '- 浼樺厛瀹屾垚鑱婂ぉ鍥炲鏈韩銆?,
-        '- 娌″繀瑕佹椂涓嶈杈撳嚭澶嶆潅鍔ㄤ綔銆?,
-        '- 鑳戒竴鍙ヨ瘽璇存竻灏变笉瑕佽繃搴﹀睍寮€銆?
+        '【默认策略】',
+        '- 优先完成聊天回复本身。',
+        '- 没必要时不要输出复杂动作。',
+        '- 能一句话说清就不要过度展开。'
     ].join('\n');
 }
 
@@ -350,7 +351,7 @@ function buildBackendWechatSystemPrompt(row, activeInstruction) {
         promptContext.time_context || '',
         promptContext.calendar_context || '',
         promptContext.itinerary_context || '',
-        `銆愬洖澶嶆寚浠ゃ€慭n${trimWechatPromptSection(activeInstruction)}`
+        `【回复指令】\n${trimWechatPromptSection(activeInstruction)}`
     ]);
 }
 function convertContextMessagesForWechatPrompt(recentContext, limit) {
@@ -529,12 +530,12 @@ function extractVisibleMessagesFromMixedResponse(rawText, options = {}) {
                     visibleMessages.push({ type: 'image', content: imageContent, description: imageDescription });
                 } else {
                     const virtualImageDescription = imageDescription && imageDescription !== imageContent
-                        ? `[鍥剧墖] ${imageDescription}`
-                        : '[鍥剧墖]';
+                        ? `[图片] ${imageDescription}`
+                        : '[图片]';
                     visibleMessages.push({
                         type: 'virtual_image',
                         content: OFFLINE_VIRTUAL_IMAGE_URL,
-                        description: String(virtualImageDescription || '').replace(/^\[[^\]]+\]\s*/, '') || '鍥剧墖鎻忚堪'
+                        description: String(virtualImageDescription || '').replace(/^\[[^\]]+\]\s*/, '') || '图片描述'
                     });
                 }
                 return;
@@ -596,29 +597,29 @@ function extractReplyContentFromAiResponse(data) {
 
 function buildActiveReplyInstruction(lastMessage, minutesPassed, triggerMode) {
     if (triggerMode === 'scheduled-opening') {
-        return `锛堢郴缁熸彁绀猴細涓诲姩娑堟伅瀹氭椂鍣ㄥ凡瑙﹀彂銆傝窛绂诲紑鍚富鍔ㄥ洖澶嶅凡缁忚繃鍘?${minutesPassed} 鍒嗛挓銆傝鍍忕湡瀹炲井淇¤亰澶╀竴鏍凤紝鑷劧鍦颁富鍔ㄥ紑鍚竴涓交鏉捐瘽棰橈紝涓嶈鍐欐垚绯荤粺閫氱煡銆傦級`;
+        return `（系统提示：主动消息定时器已触发。距离开启主动回复已经过去 ${minutesPassed} 分钟。请像真实微信聊天一样，自然地主动开启一个轻松话题，不要写成系统通知。）`;
     }
     if (triggerMode === 'scheduled-followup') {
-        return `锛堢郴缁熸彁绀猴細涓诲姩娑堟伅瀹氭椂鍣ㄥ凡瑙﹀彂銆傝窛绂讳綘涓婁竴娆′富鍔ㄦ秷鎭凡缁忚繃鍘?${minutesPassed} 鍒嗛挓锛屽鏂规殏鏃惰繕娌℃湁鍥炲銆傝鑷劧鍦拌ˉ涓€鍙ャ€佹崲涓交鏉捐瘽棰橈紝鎴栧垎浜竴涓綋涓嬬殑灏忔兂娉曪紝涓嶈鏄惧緱鏈烘鍌績銆傦級`;
+        return `（系统提示：主动消息定时器已触发。距离你上一条主动消息已经过去 ${minutesPassed} 分钟，对方暂时还没有回复。请自然地补一句、换一个轻松话题，或分享一个当下的小想法，不要显得机械催促。）`;
     }
     if (lastMessage && lastMessage.role === 'user') {
-        return `锛堢郴缁熸彁绀猴細涓诲姩娑堟伅瀹氭椂鍣ㄥ凡瑙﹀彂銆傝窛绂荤敤鎴蜂笂涓€鏉℃秷鎭凡缁忚繃鍘?${minutesPassed} 鍒嗛挓銆傝鍍忕湡浜轰竴鏍疯嚜鐒舵帴浣忓鏂瑰垰鎵嶇殑璇濓紝鍙互杞绘弿娣″啓瑙ｉ噴鍥炲绋嶆櫄锛屼篃鍙互鐩存帴椤虹潃璇濋缁х画銆傦級`;
+        return `（系统提示：主动消息定时器已触发。距离用户上一条消息已经过去 ${minutesPassed} 分钟。请像真人一样自然接住对方刚才的话，可以轻描淡写解释回复稍晚，也可以直接顺着话题继续。）`;
     }
-    return `锛堢郴缁熸彁绀猴細涓诲姩娑堟伅瀹氭椂鍣ㄥ凡瑙﹀彂銆傝窛绂讳綘涓婁竴鏉℃秷鎭凡缁忚繃鍘?${minutesPassed} 鍒嗛挓锛屽鏂逛竴鐩存病鏈夊洖澶嶃€傝鍍忕湡浜洪棿闅斾竴闃靛悗鑷劧缁亰锛屽彲浠ヨˉ涓€鍙ャ€佹崲涓交璇濋锛屾垨鍒嗕韩褰撲笅鐘舵€佷笌瑙侀椈銆傦級`;
+    return `（系统提示：主动消息定时器已触发。距离你上一条消息已经过去 ${minutesPassed} 分钟，对方一直没有回复。请像真人间隔一阵后自然续聊，可以补一句、换个轻话题，或分享当下状态与见闻。）`;
 }
 
 function fallbackMessage(contactName, lastMessage, triggerMode) {
-    const name = contactName || '瀵规柟';
+    const name = contactName || '对方';
     if (triggerMode === 'scheduled-opening') {
-        return `${name}绐佺劧鎯冲埌浣犱簡锛屾兂鏉ユ壘浣犺亰涓ゅ彞銆俙;
+        return `${name}突然想到你了，想来找你聊两句。`;
     }
     if (triggerMode === 'scheduled-followup') {
-        return '鍒氬垰鍙堟兂鍒颁竴浠跺皬浜嬶紝鎯崇户缁拰浣犺璇淬€?;
+        return '刚刚又想到一件小事，想继续和你说说。';
     }
     if (lastMessage && lastMessage.role === 'user') {
-        return `鍒氬垰鍦ㄥ繖锛岀幇鍦ㄧ湅鍒板暒銆?{name}锛屾兂鎺ョ潃鍜屼綘鑱娿€俙;
+        return `刚刚在忙，现在看到啦，${name}，想接着和你聊。`;
     }
-    return `${name}闅斾簡涓€浼氬効鍙堟潵鎵句綘锛氭垜绐佺劧鎯冲埌涓€浠朵簨锛屾兂缁х画鍜屼綘璇淬€俙;
+    return `${name}隔了一会儿又来找你：我突然想到一件事，想继续和你说。`;
 }
 function normalizeRestScheduleMinute(value, fallback) {
     const num = Number(value);
@@ -651,6 +652,12 @@ function formatRestWindowKey(dateLike) {
     return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 }
 
+function buildDateWithMinute(dateLike, minute) {
+    const date = dateLike instanceof Date ? new Date(dateLike.getTime()) : new Date(dateLike || Date.now());
+    date.setHours(Math.floor(minute / 60), minute % 60, 0, 0);
+    return date;
+}
+
 function getRestScheduleState(row, now = Date.now()) {
     const enabled = !!(row && (row.rest_schedule_enabled || row.restScheduleEnabled));
     const startMinute = normalizeRestScheduleMinute(
@@ -665,14 +672,24 @@ function getRestScheduleState(row, now = Date.now()) {
     const currentMinute = (date.getHours() * 60) + date.getMinutes();
     let inRestWindow = false;
     let windowKey = null;
+    let startTimeMs = null;
+    let endTimeMs = null;
 
     if (enabled) {
         if (startMinute === endMinute) {
             inRestWindow = true;
             windowKey = formatRestWindowKey(date);
+            const startDate = buildDateWithMinute(date, startMinute);
+            const endDate = new Date(startDate.getTime() + 86400000);
+            startTimeMs = startDate.getTime();
+            endTimeMs = endDate.getTime();
         } else if (startMinute < endMinute) {
             inRestWindow = currentMinute >= startMinute && currentMinute < endMinute;
-            if (inRestWindow) windowKey = formatRestWindowKey(date);
+            if (inRestWindow) {
+                windowKey = formatRestWindowKey(date);
+                startTimeMs = buildDateWithMinute(date, startMinute).getTime();
+                endTimeMs = buildDateWithMinute(date, endMinute).getTime();
+            }
         } else {
             inRestWindow = currentMinute >= startMinute || currentMinute < endMinute;
             if (inRestWindow) {
@@ -681,11 +698,57 @@ function getRestScheduleState(row, now = Date.now()) {
                     startDate.setDate(startDate.getDate() - 1);
                 }
                 windowKey = formatRestWindowKey(startDate);
+                const endDate = new Date(startDate.getTime());
+                endDate.setDate(endDate.getDate() + 1);
+                startTimeMs = buildDateWithMinute(startDate, startMinute).getTime();
+                endTimeMs = buildDateWithMinute(endDate, endMinute).getTime();
             }
         }
     }
 
-    return { enabled, inRestWindow, startMinute, endMinute, windowKey };
+    return { enabled, inRestWindow, startMinute, endMinute, windowKey, startTimeMs, endTimeMs };
+}
+
+function isRestAwakeOverrideActive(row, now = Date.now(), restState = null) {
+    const state = restState || getRestScheduleState(row, now);
+    return !!(
+        state
+        && state.inRestWindow
+        && state.windowKey
+        && Number(row && row.rest_awake_override || 0)
+        && (row && row.rest_awake_window_key || null) === state.windowKey
+    );
+}
+
+function syncRowRestStateFromAssistantMessage(row, message, now = Date.now()) {
+    if (!row || !message) return false;
+    const state = getRestScheduleState(row, now);
+    if (!state.enabled || !state.inRestWindow || !state.windowKey) {
+        return false;
+    }
+
+    const type = String(message.type || 'text');
+    const content = String(message.content || '').trim();
+    if (type === 'text' && !content) {
+        return false;
+    }
+
+    const nextOverride = type === 'text' && CONTACT_REST_OFFLINE_REGEX.test(content) ? 0 : 1;
+    const nextWindowKey = state.windowKey;
+    if (Number(row.rest_awake_override || 0) === nextOverride && (row.rest_awake_window_key || null) === nextWindowKey) {
+        return false;
+    }
+
+    row.rest_awake_override = nextOverride;
+    row.rest_awake_window_key = nextWindowKey;
+    updateRestStateStmt.run({
+        user_id: row.user_id,
+        contact_id: String(row.contact_id),
+        rest_awake_override: nextOverride,
+        rest_awake_window_key: nextWindowKey,
+        updated_at: now
+    });
+    return true;
 }
 
 function normalizeContactRestStateRow(row, now = Date.now()) {
@@ -731,6 +794,11 @@ function refreshStoredRestState(row, now = Date.now()) {
 }
 function serializeContactRow(row) {
     if (!row) return null;
+    const now = Date.now();
+    const restState = getRestScheduleState(row, now);
+    const restAwakened = isRestAwakeOverrideActive(row, now, restState);
+    const restStartTime = formatRestScheduleMinuteToClock(row.rest_schedule_start_minute, '21:00');
+    const restEndTime = formatRestScheduleMinuteToClock(row.rest_schedule_end_minute, '09:00');
     return {
         ...row,
         userId: row.user_id,
@@ -744,10 +812,14 @@ function serializeContactRow(row) {
         restScheduleEnabled: !!row.rest_schedule_enabled,
         restScheduleStartMinute: normalizeRestScheduleMinute(row.rest_schedule_start_minute, 21 * 60),
         restScheduleEndMinute: normalizeRestScheduleMinute(row.rest_schedule_end_minute, 9 * 60),
-        restScheduleStartTime: formatRestScheduleMinuteToClock(row.rest_schedule_start_minute, '21:00'),
-        restScheduleEndTime: formatRestScheduleMinuteToClock(row.rest_schedule_end_minute, '09:00'),
+        restScheduleStartTime: restStartTime,
+        restScheduleEndTime: restEndTime,
         restAwakeOverride: !!row.rest_awake_override,
         restAwakeWindowKey: row.rest_awake_window_key || null,
+        restWindowEnabled: !!row.rest_schedule_enabled,
+        restWindowStart: restStartTime,
+        restWindowEnd: restEndTime,
+        restWindowAwakenedAt: restAwakened ? now : null,
         lastTriggeredMsgId: row.last_triggered_msg_id || null,
         lastSeenMessageId: row.last_seen_message_id || null,
         createdAt: Number(row.created_at || 0),
@@ -899,7 +971,7 @@ async function generateAiReplyContent(row, minutesPassed, triggerMode) {
 
     if (!profile || !profile.api_url || !cleanApiKey || !profile.model) {
         return {
-            content: fallbackMessage(row.name || '瀵规柟', row, triggerMode),
+            content: fallbackMessage(row.name || '对方', row, triggerMode),
             rawContent: fallbackMessage(row && row.name, row, triggerMode),
             usedFallback: true,
             debug: 'missing_ai_profile'
@@ -912,7 +984,7 @@ async function generateAiReplyContent(row, minutesPassed, triggerMode) {
     const messages = [
         { role: 'system', content: systemPrompt },
         ...contextMessages,
-        { role: 'system', content: `浠ヤ笅鏄湰娆′富鍔ㄥ洖澶嶇殑闄勫姞瑕佹眰锛岃鐞嗚В鍚庤嚜鐒跺洖澶嶏紝涓嶈鐩存帴澶嶈堪锛歕n${instruction}` }
+        { role: 'system', content: `以下是本次主动回复的附加要求，请理解后自然回复，不要直接复述：\n${instruction}` }
     ];
 
     try {
@@ -949,7 +1021,7 @@ async function generateAiReplyContent(row, minutesPassed, triggerMode) {
             content: extractVisibleTextFromMixedResponse(content)
                 .replace(/<thinking>[\s\S]*?<\/thinking>/g, '')
                 .replace(/<think>[\s\S]*?<\/think>/g, '')
-                .trim() || fallbackMessage(row.name || '瀵规柟', row, triggerMode),
+                .trim() || fallbackMessage(row.name || '对方', row, triggerMode),
             rawContent: rawContent || content,
             usedFallback: false,
             debug: extractedReply.source || 'ai_generated'
@@ -957,7 +1029,7 @@ async function generateAiReplyContent(row, minutesPassed, triggerMode) {
     } catch (err) {
         console.error('[offline-ai] generateAiReplyContent failed', err);
         return {
-            content: fallbackMessage(row.name || '瀵规柟', row, triggerMode),
+            content: fallbackMessage(row.name || '对方', row, triggerMode),
             rawContent: fallbackMessage(row && row.name, row, triggerMode),
             usedFallback: true,
             debug: err && err.message ? err.message : 'ai_error'
@@ -991,33 +1063,33 @@ async function createOfflineMessage(row, now, options = {}) {
         .filter((item) => item.content);
     const normalizedMessages = visibleMessages.length > 0
         ? visibleMessages
-        : [{ type: 'text', content: fallbackMessage(row.name || '瀵规柟', rowForGeneration, triggerMode) }];
+        : [{ type: 'text', content: fallbackMessage(row.name || '对方', rowForGeneration, triggerMode) }];
 
     const getPreviewText = (messageItem) => {
         if (!messageItem || typeof messageItem !== 'object') return '';
         if (messageItem.type === 'sticker') {
-            return '[鍔ㄧ敾琛ㄦ儏]';
+            return '[动画表情]';
         }
         if (messageItem.type === 'image' || messageItem.type === 'virtual_image') {
-            return isLikelyAnimatedPreviewUrl(messageItem.content) ? '[鍔ㄧ敾琛ㄦ儏]' : '[鍥剧墖]';
+            return isLikelyAnimatedPreviewUrl(messageItem.content) ? '[动画表情]' : '[图片]';
         }
         if (messageItem.type === 'voice') {
-            return '[璇煶]';
+            return '[语音]';
         }
         if (isLikelyAnimatedPreviewUrl(messageItem.content) || isLikelyAnimatedPreviewUrl(messageItem.description)) {
-            return '[鍔ㄧ敾琛ㄦ儏]';
+            return '[动画表情]';
         }
         if (isLikelyImagePreviewUrl(messageItem.content)) {
-            return '[鍥剧墖]';
+            return '[图片]';
         }
         if (messageItem.type === 'sticker') {
-            return `[琛ㄦ儏鍖匽 ${messageItem.description || messageItem.content || ''}`.trim();
+            return `[表情包] ${messageItem.description || messageItem.content || ''}`.trim();
         }
         if (messageItem.type === 'image' || messageItem.type === 'virtual_image') {
-            return '[鍥剧墖]';
+            return '[图片]';
         }
         if (messageItem.type === 'voice') {
-            return '[璇煶]';
+            return '[语音]';
         }
         return String(messageItem.content || '').trim();
     };
@@ -1066,6 +1138,10 @@ async function createOfflineMessage(row, now, options = {}) {
         return null;
     }
 
+    normalizedMessages.forEach((messageItem, index) => {
+        syncRowRestStateFromAssistantMessage(row, messageItem, now + index);
+    });
+
     updateTriggerStateStmt.run(firstMessageId, now, consumedSnapshotId, now, row.user_id, String(row.contact_id));
 
     const push = {
@@ -1075,7 +1151,7 @@ async function createOfflineMessage(row, now, options = {}) {
         attempted: 0
     };
     for (const insertedMessage of insertedMessages) {
-        const notificationTitle = row.name ? String(row.name).trim() : '鏂版秷鎭?;
+        const notificationTitle = row.name ? String(row.name).trim() : '新消息';
         const notificationBody = insertedMessage.preview || insertedMessage.content;
         const avatarUrl = resolvePushAvatarUrl(row);
         const pushResult = await sendPushToUser(row.user_id, {
@@ -1130,7 +1206,7 @@ async function createOfflineMessage(row, now, options = {}) {
 
 function resolveActiveReplyTrigger(row, now) {
     const restState = getRestScheduleState(row, now);
-    if (restState.inRestWindow) {
+    if (restState.inRestWindow && !isRestAwakeOverrideActive(row, now, restState)) {
         return null;
     }
     const activeReplyStartTime = Number(row.active_reply_start_time || 0);
@@ -1289,6 +1365,9 @@ app.post('/api/contacts', (req, res) => {
     const now = Date.now();
     const userId = body.userId || 'default-user';
     const contactId = String(body.contactId);
+    const requestedRestEnabled = body.restWindowEnabled !== undefined
+        ? !!body.restWindowEnabled
+        : !!body.restScheduleEnabled;
     const requestedIntervalSec = Number(
         body.activeReplyIntervalSec !== undefined
             ? body.activeReplyIntervalSec
@@ -1297,13 +1376,44 @@ app.post('/api/contacts', (req, res) => {
     const requestedRestStartMinute = Number(
         body.restScheduleStartMinute !== undefined
             ? body.restScheduleStartMinute
+            : body.restWindowStart !== undefined
+                ? parseRestScheduleClockToMinute(body.restWindowStart, 21 * 60)
             : parseRestScheduleClockToMinute(body.restScheduleStartTime, 21 * 60)
     );
     const requestedRestEndMinute = Number(
         body.restScheduleEndMinute !== undefined
             ? body.restScheduleEndMinute
+            : body.restWindowEnd !== undefined
+                ? parseRestScheduleClockToMinute(body.restWindowEnd, 9 * 60)
             : parseRestScheduleClockToMinute(body.restScheduleEndTime, 9 * 60)
     );
+    const normalizedRestStartMinute = normalizeRestScheduleMinute(requestedRestStartMinute, 21 * 60);
+    const normalizedRestEndMinute = normalizeRestScheduleMinute(requestedRestEndMinute, 9 * 60);
+    const requestedRestState = getRestScheduleState({
+        rest_schedule_enabled: requestedRestEnabled ? 1 : 0,
+        rest_schedule_start_minute: normalizedRestStartMinute,
+        rest_schedule_end_minute: normalizedRestEndMinute
+    }, now);
+    let requestedRestAwakeOverride = body.restAwakeOverride ? 1 : 0;
+    let requestedRestAwakeWindowKey = body.restAwakeWindowKey || null;
+
+    if (body.restWindowAwakenedAt !== undefined) {
+        const awakenedAt = Number(body.restWindowAwakenedAt || 0);
+        const isAwakenedInCurrentWindow = !!(
+            requestedRestState.inRestWindow
+            && Number.isFinite(awakenedAt)
+            && awakenedAt >= Number(requestedRestState.startTimeMs || 0)
+            && awakenedAt < Number(requestedRestState.endTimeMs || 0)
+        );
+        requestedRestAwakeOverride = isAwakenedInCurrentWindow ? 1 : 0;
+        requestedRestAwakeWindowKey = requestedRestState.inRestWindow ? requestedRestState.windowKey : null;
+    } else if (!requestedRestState.inRestWindow) {
+        requestedRestAwakeOverride = 0;
+        requestedRestAwakeWindowKey = null;
+    } else if (requestedRestAwakeOverride && !requestedRestAwakeWindowKey) {
+        requestedRestAwakeWindowKey = requestedRestState.windowKey;
+    }
+
     upsertContactStmt.run({
         user_id: userId,
         contact_id: contactId,
@@ -1314,11 +1424,11 @@ app.post('/api/contacts', (req, res) => {
         active_reply_enabled: body.activeReplyEnabled ? 1 : 0,
         active_reply_interval_sec: Math.max(1, Math.round(Number.isFinite(requestedIntervalSec) ? requestedIntervalSec : 60)),
         active_reply_start_time: Number(body.activeReplyStartTime || 0),
-        rest_schedule_enabled: body.restScheduleEnabled ? 1 : 0,
-        rest_schedule_start_minute: normalizeRestScheduleMinute(requestedRestStartMinute, 21 * 60),
-        rest_schedule_end_minute: normalizeRestScheduleMinute(requestedRestEndMinute, 9 * 60),
-        rest_awake_override: body.restAwakeOverride ? 1 : 0,
-        rest_awake_window_key: body.restAwakeWindowKey || null,
+        rest_schedule_enabled: requestedRestEnabled ? 1 : 0,
+        rest_schedule_start_minute: normalizedRestStartMinute,
+        rest_schedule_end_minute: normalizedRestEndMinute,
+        rest_awake_override: requestedRestAwakeOverride,
+        rest_awake_window_key: requestedRestAwakeWindowKey,
         last_triggered_msg_id: body.lastActiveReplyTriggeredMsgId || null,
         created_at: now,
         updated_at: now
@@ -1344,6 +1454,9 @@ app.post('/api/messages/snapshot', (req, res) => {
     const row = db.prepare(`SELECT * FROM contacts WHERE user_id = ? AND contact_id = ?`).get(body.userId || 'default-user', String(body.contactId));
     if (row) {
         refreshStoredRestState(row, Date.now());
+        if (String(lastMessage.role || 'assistant') === 'assistant') {
+            syncRowRestStateFromAssistantMessage(row, lastMessage, Number(lastMessage.time || Date.now()));
+        }
     }
     upsertSnapshotStmt.run({
         user_id: body.userId || 'default-user',
@@ -1397,7 +1510,9 @@ app.post('/api/messages/delete', (req, res) => {
 app.post('/api/debug/trigger-active-reply', async (req, res) => {
     const body = req.body || {};
     const row = db.prepare(`
-        SELECT c.user_id, c.contact_id, c.name, c.avatar_url, c.persona_prompt, c.context_limit, c.active_reply_enabled, c.active_reply_interval_sec, c.active_reply_start_time, c.last_triggered_msg_id,
+        SELECT c.user_id, c.contact_id, c.name, c.avatar_url, c.persona_prompt, c.context_limit, c.active_reply_enabled, c.active_reply_interval_sec, c.active_reply_start_time,
+               c.rest_schedule_enabled, c.rest_schedule_start_minute, c.rest_schedule_end_minute, c.rest_awake_override, c.rest_awake_window_key,
+               c.last_triggered_msg_id,
                s.message_id, s.role, s.content, s.type, s.time
         FROM contacts c
         LEFT JOIN message_snapshots s ON s.user_id = c.user_id AND s.contact_id = c.contact_id
