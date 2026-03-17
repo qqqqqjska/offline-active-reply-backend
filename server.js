@@ -30,7 +30,6 @@ if (!vapidPublicKey || !vapidPrivateKey) {
 
 const PUSH_ENABLED = Boolean(vapidPublicKey && vapidPrivateKey && vapidSubject);
 let activeReplyCheckPromise = null;
-const CONTACT_REST_OFFLINE_REGEX = /(晚安|先睡了|睡了|去睡|去睡觉|睡觉了|先休息|休息了|我先下了|先下了|下线|离线|回头聊)/;
 
 if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -652,12 +651,6 @@ function formatRestWindowKey(dateLike) {
     return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 }
 
-function buildDateWithMinute(dateLike, minute) {
-    const date = dateLike instanceof Date ? new Date(dateLike.getTime()) : new Date(dateLike || Date.now());
-    date.setHours(Math.floor(minute / 60), minute % 60, 0, 0);
-    return date;
-}
-
 function getRestScheduleState(row, now = Date.now()) {
     const enabled = !!(row && (row.rest_schedule_enabled || row.restScheduleEnabled));
     const startMinute = normalizeRestScheduleMinute(
@@ -672,24 +665,14 @@ function getRestScheduleState(row, now = Date.now()) {
     const currentMinute = (date.getHours() * 60) + date.getMinutes();
     let inRestWindow = false;
     let windowKey = null;
-    let startTimeMs = null;
-    let endTimeMs = null;
 
     if (enabled) {
         if (startMinute === endMinute) {
             inRestWindow = true;
             windowKey = formatRestWindowKey(date);
-            const startDate = buildDateWithMinute(date, startMinute);
-            const endDate = new Date(startDate.getTime() + 86400000);
-            startTimeMs = startDate.getTime();
-            endTimeMs = endDate.getTime();
         } else if (startMinute < endMinute) {
             inRestWindow = currentMinute >= startMinute && currentMinute < endMinute;
-            if (inRestWindow) {
-                windowKey = formatRestWindowKey(date);
-                startTimeMs = buildDateWithMinute(date, startMinute).getTime();
-                endTimeMs = buildDateWithMinute(date, endMinute).getTime();
-            }
+            if (inRestWindow) windowKey = formatRestWindowKey(date);
         } else {
             inRestWindow = currentMinute >= startMinute || currentMinute < endMinute;
             if (inRestWindow) {
@@ -698,57 +681,11 @@ function getRestScheduleState(row, now = Date.now()) {
                     startDate.setDate(startDate.getDate() - 1);
                 }
                 windowKey = formatRestWindowKey(startDate);
-                const endDate = new Date(startDate.getTime());
-                endDate.setDate(endDate.getDate() + 1);
-                startTimeMs = buildDateWithMinute(startDate, startMinute).getTime();
-                endTimeMs = buildDateWithMinute(endDate, endMinute).getTime();
             }
         }
     }
 
-    return { enabled, inRestWindow, startMinute, endMinute, windowKey, startTimeMs, endTimeMs };
-}
-
-function isRestAwakeOverrideActive(row, now = Date.now(), restState = null) {
-    const state = restState || getRestScheduleState(row, now);
-    return !!(
-        state
-        && state.inRestWindow
-        && state.windowKey
-        && Number(row && row.rest_awake_override || 0)
-        && (row && row.rest_awake_window_key || null) === state.windowKey
-    );
-}
-
-function syncRowRestStateFromAssistantMessage(row, message, now = Date.now()) {
-    if (!row || !message) return false;
-    const state = getRestScheduleState(row, now);
-    if (!state.enabled || !state.inRestWindow || !state.windowKey) {
-        return false;
-    }
-
-    const type = String(message.type || 'text');
-    const content = String(message.content || '').trim();
-    if (type === 'text' && !content) {
-        return false;
-    }
-
-    const nextOverride = type === 'text' && CONTACT_REST_OFFLINE_REGEX.test(content) ? 0 : 1;
-    const nextWindowKey = state.windowKey;
-    if (Number(row.rest_awake_override || 0) === nextOverride && (row.rest_awake_window_key || null) === nextWindowKey) {
-        return false;
-    }
-
-    row.rest_awake_override = nextOverride;
-    row.rest_awake_window_key = nextWindowKey;
-    updateRestStateStmt.run({
-        user_id: row.user_id,
-        contact_id: String(row.contact_id),
-        rest_awake_override: nextOverride,
-        rest_awake_window_key: nextWindowKey,
-        updated_at: now
-    });
-    return true;
+    return { enabled, inRestWindow, startMinute, endMinute, windowKey };
 }
 
 function normalizeContactRestStateRow(row, now = Date.now()) {
@@ -794,11 +731,6 @@ function refreshStoredRestState(row, now = Date.now()) {
 }
 function serializeContactRow(row) {
     if (!row) return null;
-    const now = Date.now();
-    const restState = getRestScheduleState(row, now);
-    const restAwakened = isRestAwakeOverrideActive(row, now, restState);
-    const restStartTime = formatRestScheduleMinuteToClock(row.rest_schedule_start_minute, '21:00');
-    const restEndTime = formatRestScheduleMinuteToClock(row.rest_schedule_end_minute, '09:00');
     return {
         ...row,
         userId: row.user_id,
@@ -812,14 +744,10 @@ function serializeContactRow(row) {
         restScheduleEnabled: !!row.rest_schedule_enabled,
         restScheduleStartMinute: normalizeRestScheduleMinute(row.rest_schedule_start_minute, 21 * 60),
         restScheduleEndMinute: normalizeRestScheduleMinute(row.rest_schedule_end_minute, 9 * 60),
-        restScheduleStartTime: restStartTime,
-        restScheduleEndTime: restEndTime,
+        restScheduleStartTime: formatRestScheduleMinuteToClock(row.rest_schedule_start_minute, '21:00'),
+        restScheduleEndTime: formatRestScheduleMinuteToClock(row.rest_schedule_end_minute, '09:00'),
         restAwakeOverride: !!row.rest_awake_override,
         restAwakeWindowKey: row.rest_awake_window_key || null,
-        restWindowEnabled: !!row.rest_schedule_enabled,
-        restWindowStart: restStartTime,
-        restWindowEnd: restEndTime,
-        restWindowAwakenedAt: restAwakened ? now : null,
         lastTriggeredMsgId: row.last_triggered_msg_id || null,
         lastSeenMessageId: row.last_seen_message_id || null,
         createdAt: Number(row.created_at || 0),
@@ -1138,10 +1066,6 @@ async function createOfflineMessage(row, now, options = {}) {
         return null;
     }
 
-    normalizedMessages.forEach((messageItem, index) => {
-        syncRowRestStateFromAssistantMessage(row, messageItem, now + index);
-    });
-
     updateTriggerStateStmt.run(firstMessageId, now, consumedSnapshotId, now, row.user_id, String(row.contact_id));
 
     const push = {
@@ -1206,7 +1130,7 @@ async function createOfflineMessage(row, now, options = {}) {
 
 function resolveActiveReplyTrigger(row, now) {
     const restState = getRestScheduleState(row, now);
-    if (restState.inRestWindow && !isRestAwakeOverrideActive(row, now, restState)) {
+    if (restState.inRestWindow) {
         return null;
     }
     const activeReplyStartTime = Number(row.active_reply_start_time || 0);
@@ -1365,9 +1289,6 @@ app.post('/api/contacts', (req, res) => {
     const now = Date.now();
     const userId = body.userId || 'default-user';
     const contactId = String(body.contactId);
-    const requestedRestEnabled = body.restWindowEnabled !== undefined
-        ? !!body.restWindowEnabled
-        : !!body.restScheduleEnabled;
     const requestedIntervalSec = Number(
         body.activeReplyIntervalSec !== undefined
             ? body.activeReplyIntervalSec
@@ -1376,44 +1297,13 @@ app.post('/api/contacts', (req, res) => {
     const requestedRestStartMinute = Number(
         body.restScheduleStartMinute !== undefined
             ? body.restScheduleStartMinute
-            : body.restWindowStart !== undefined
-                ? parseRestScheduleClockToMinute(body.restWindowStart, 21 * 60)
             : parseRestScheduleClockToMinute(body.restScheduleStartTime, 21 * 60)
     );
     const requestedRestEndMinute = Number(
         body.restScheduleEndMinute !== undefined
             ? body.restScheduleEndMinute
-            : body.restWindowEnd !== undefined
-                ? parseRestScheduleClockToMinute(body.restWindowEnd, 9 * 60)
             : parseRestScheduleClockToMinute(body.restScheduleEndTime, 9 * 60)
     );
-    const normalizedRestStartMinute = normalizeRestScheduleMinute(requestedRestStartMinute, 21 * 60);
-    const normalizedRestEndMinute = normalizeRestScheduleMinute(requestedRestEndMinute, 9 * 60);
-    const requestedRestState = getRestScheduleState({
-        rest_schedule_enabled: requestedRestEnabled ? 1 : 0,
-        rest_schedule_start_minute: normalizedRestStartMinute,
-        rest_schedule_end_minute: normalizedRestEndMinute
-    }, now);
-    let requestedRestAwakeOverride = body.restAwakeOverride ? 1 : 0;
-    let requestedRestAwakeWindowKey = body.restAwakeWindowKey || null;
-
-    if (body.restWindowAwakenedAt !== undefined) {
-        const awakenedAt = Number(body.restWindowAwakenedAt || 0);
-        const isAwakenedInCurrentWindow = !!(
-            requestedRestState.inRestWindow
-            && Number.isFinite(awakenedAt)
-            && awakenedAt >= Number(requestedRestState.startTimeMs || 0)
-            && awakenedAt < Number(requestedRestState.endTimeMs || 0)
-        );
-        requestedRestAwakeOverride = isAwakenedInCurrentWindow ? 1 : 0;
-        requestedRestAwakeWindowKey = requestedRestState.inRestWindow ? requestedRestState.windowKey : null;
-    } else if (!requestedRestState.inRestWindow) {
-        requestedRestAwakeOverride = 0;
-        requestedRestAwakeWindowKey = null;
-    } else if (requestedRestAwakeOverride && !requestedRestAwakeWindowKey) {
-        requestedRestAwakeWindowKey = requestedRestState.windowKey;
-    }
-
     upsertContactStmt.run({
         user_id: userId,
         contact_id: contactId,
@@ -1424,11 +1314,11 @@ app.post('/api/contacts', (req, res) => {
         active_reply_enabled: body.activeReplyEnabled ? 1 : 0,
         active_reply_interval_sec: Math.max(1, Math.round(Number.isFinite(requestedIntervalSec) ? requestedIntervalSec : 60)),
         active_reply_start_time: Number(body.activeReplyStartTime || 0),
-        rest_schedule_enabled: requestedRestEnabled ? 1 : 0,
-        rest_schedule_start_minute: normalizedRestStartMinute,
-        rest_schedule_end_minute: normalizedRestEndMinute,
-        rest_awake_override: requestedRestAwakeOverride,
-        rest_awake_window_key: requestedRestAwakeWindowKey,
+        rest_schedule_enabled: body.restScheduleEnabled ? 1 : 0,
+        rest_schedule_start_minute: normalizeRestScheduleMinute(requestedRestStartMinute, 21 * 60),
+        rest_schedule_end_minute: normalizeRestScheduleMinute(requestedRestEndMinute, 9 * 60),
+        rest_awake_override: body.restAwakeOverride ? 1 : 0,
+        rest_awake_window_key: body.restAwakeWindowKey || null,
         last_triggered_msg_id: body.lastActiveReplyTriggeredMsgId || null,
         created_at: now,
         updated_at: now
@@ -1454,9 +1344,6 @@ app.post('/api/messages/snapshot', (req, res) => {
     const row = db.prepare(`SELECT * FROM contacts WHERE user_id = ? AND contact_id = ?`).get(body.userId || 'default-user', String(body.contactId));
     if (row) {
         refreshStoredRestState(row, Date.now());
-        if (String(lastMessage.role || 'assistant') === 'assistant') {
-            syncRowRestStateFromAssistantMessage(row, lastMessage, Number(lastMessage.time || Date.now()));
-        }
     }
     upsertSnapshotStmt.run({
         user_id: body.userId || 'default-user',
@@ -1510,9 +1397,7 @@ app.post('/api/messages/delete', (req, res) => {
 app.post('/api/debug/trigger-active-reply', async (req, res) => {
     const body = req.body || {};
     const row = db.prepare(`
-        SELECT c.user_id, c.contact_id, c.name, c.avatar_url, c.persona_prompt, c.context_limit, c.active_reply_enabled, c.active_reply_interval_sec, c.active_reply_start_time,
-               c.rest_schedule_enabled, c.rest_schedule_start_minute, c.rest_schedule_end_minute, c.rest_awake_override, c.rest_awake_window_key,
-               c.last_triggered_msg_id,
+        SELECT c.user_id, c.contact_id, c.name, c.avatar_url, c.persona_prompt, c.context_limit, c.active_reply_enabled, c.active_reply_interval_sec, c.active_reply_start_time, c.last_triggered_msg_id,
                s.message_id, s.role, s.content, s.type, s.time
         FROM contacts c
         LEFT JOIN message_snapshots s ON s.user_id = c.user_id AND s.contact_id = c.contact_id
