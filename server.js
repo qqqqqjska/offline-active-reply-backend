@@ -1204,14 +1204,22 @@ async function createOfflineMessage(row, now, options = {}) {
     };
 }
 
-function resolveActiveReplyTrigger(row, now) {
+function resolveActiveReplyTriggerDecision(row, now) {
     const restState = getRestScheduleState(row, now);
     if (restState.inRestWindow && !isRestAwakeOverrideActive(row, now, restState)) {
-        return null;
+        return {
+            trigger: null,
+            reason: 'in_rest_window',
+            detail: `window=${restState.windowKey || 'none'} awake=${isRestAwakeOverrideActive(row, now, restState) ? 1 : 0}`
+        };
     }
     const activeReplyStartTime = Number(row.active_reply_start_time || 0);
     if (activeReplyStartTime > now) {
-        return null;
+        return {
+            trigger: null,
+            reason: 'start_time_in_future',
+            detail: `activeReplyStartTime=${activeReplyStartTime} now=${now}`
+        };
     }
 
     const requiredMs = Math.max(1, Number(row.active_reply_interval_sec || 60)) * 1000;
@@ -1226,30 +1234,54 @@ function resolveActiveReplyTrigger(row, now) {
 
     if (hasFreshSnapshot) {
         if ((now - snapshotTime) < requiredMs) {
-            return null;
+            return {
+                trigger: null,
+                reason: 'waiting_after_snapshot',
+                detail: `remainingMs=${requiredMs - (now - snapshotTime)} snapshotId=${snapshotId}`
+            };
         }
         return {
-            triggerMode: 'after-message',
-            referenceTime: snapshotTime,
-            consumedSnapshotId: snapshotId,
-            messageStateId: snapshotId
+            trigger: {
+                triggerMode: 'after-message',
+                referenceTime: snapshotTime,
+                consumedSnapshotId: snapshotId,
+                messageStateId: snapshotId
+            },
+            reason: 'trigger_after_snapshot',
+            detail: `snapshotId=${snapshotId}`
         };
     }
 
     const baselineTime = Math.max(lastTriggeredAt, activeReplyStartTime);
     if (!baselineTime) {
-        return null;
+        return {
+            trigger: null,
+            reason: 'missing_baseline_time',
+            detail: `lastTriggeredAt=${lastTriggeredAt} activeReplyStartTime=${activeReplyStartTime} snapshotId=${snapshotId || 'none'}`
+        };
     }
     if ((now - baselineTime) < requiredMs) {
-        return null;
+        return {
+            trigger: null,
+            reason: 'waiting_after_baseline',
+            detail: `remainingMs=${requiredMs - (now - baselineTime)} baselineTime=${baselineTime}`
+        };
     }
 
     return {
-        triggerMode: lastTriggeredAt > 0 ? 'scheduled-followup' : 'scheduled-opening',
-        referenceTime: baselineTime,
-        consumedSnapshotId: snapshotId || lastSeenMessageId || null,
-        messageStateId: snapshotId || lastSeenMessageId || `timer-${baselineTime}`
+        trigger: {
+            triggerMode: lastTriggeredAt > 0 ? 'scheduled-followup' : 'scheduled-opening',
+            referenceTime: baselineTime,
+            consumedSnapshotId: snapshotId || lastSeenMessageId || null,
+            messageStateId: snapshotId || lastSeenMessageId || `timer-${baselineTime}`
+        },
+        reason: lastTriggeredAt > 0 ? 'trigger_scheduled_followup' : 'trigger_scheduled_opening',
+        detail: `baselineTime=${baselineTime} snapshotId=${snapshotId || 'none'} lastSeenMessageId=${lastSeenMessageId || 'none'}`
     };
+}
+
+function resolveActiveReplyTrigger(row, now) {
+    return resolveActiveReplyTriggerDecision(row, now).trigger;
 }
 
 async function runActiveReplyCheck() {
@@ -1273,12 +1305,22 @@ async function runActiveReplyCheck() {
 
         for (const row of rows) {
             refreshStoredRestState(row, now);
-            const trigger = resolveActiveReplyTrigger(row, now);
-            if (!trigger) continue;
+            const decision = resolveActiveReplyTriggerDecision(row, now);
+            const trigger = decision.trigger;
+            const label = `${row.name ? String(row.name).trim() : 'unknown'}#${String(row.contact_id)}`;
+            if (!trigger) {
+                console.log(`[active-reply-skip] ${label} reason=${decision.reason} detail=${decision.detail || 'none'}`);
+                continue;
+            }
+
+            console.log(`[active-reply-trigger] ${label} reason=${decision.reason} mode=${trigger.triggerMode} detail=${decision.detail || 'none'}`);
 
             const created = await createOfflineMessage(row, now, trigger);
             if (created) {
                 triggered += 1;
+                console.log(`[active-reply-created] ${label} mode=${created.triggerMode} messageCount=${created.messageCount} usedFallback=${created.usedFallback ? 1 : 0} debug=${created.debug || 'none'}`);
+            } else {
+                console.log(`[active-reply-skip] ${label} reason=create_offline_message_returned_null detail=mode=${trigger.triggerMode} messageStateId=${trigger.messageStateId}`);
             }
         }
 
