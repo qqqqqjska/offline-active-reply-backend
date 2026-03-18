@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS contacts (
   name TEXT,
   avatar_url TEXT,
   persona_prompt TEXT,
+  timezone_offset_minutes INTEGER NOT NULL DEFAULT 0,
   context_limit INTEGER NOT NULL DEFAULT 50,
   active_reply_enabled INTEGER NOT NULL DEFAULT 0,
   active_reply_interval_sec INTEGER NOT NULL DEFAULT 60,
@@ -165,6 +166,9 @@ if (!contactTableColumns.some((column) => column && column.name === 'rest_awake_
 if (!contactTableColumns.some((column) => column && column.name === 'rest_awake_window_key')) {
     db.exec(`ALTER TABLE contacts ADD COLUMN rest_awake_window_key TEXT`);
 }
+if (!contactTableColumns.some((column) => column && column.name === 'timezone_offset_minutes')) {
+    db.exec(`ALTER TABLE contacts ADD COLUMN timezone_offset_minutes INTEGER NOT NULL DEFAULT 0`);
+}
 
 const aiProfileTableColumns = db.prepare(`PRAGMA table_info(ai_profiles)`).all();
 if (!aiProfileTableColumns.some((column) => column && column.name === 'default_virtual_image_url')) {
@@ -175,12 +179,13 @@ app.use(cors({ origin: APP_ORIGIN === '*' ? true : APP_ORIGIN, credentials: fals
 app.use(express.json({ limit: '8mb' }));
 
 const upsertContactStmt = db.prepare(`
-INSERT INTO contacts (user_id, contact_id, name, avatar_url, persona_prompt, context_limit, active_reply_enabled, active_reply_interval_sec, active_reply_start_time, rest_schedule_enabled, rest_schedule_start_minute, rest_schedule_end_minute, rest_awake_override, rest_awake_window_key, last_triggered_msg_id, created_at, updated_at)
-VALUES (@user_id, @contact_id, @name, @avatar_url, @persona_prompt, @context_limit, @active_reply_enabled, @active_reply_interval_sec, @active_reply_start_time, @rest_schedule_enabled, @rest_schedule_start_minute, @rest_schedule_end_minute, @rest_awake_override, @rest_awake_window_key, @last_triggered_msg_id, @created_at, @updated_at)
+INSERT INTO contacts (user_id, contact_id, name, avatar_url, persona_prompt, timezone_offset_minutes, context_limit, active_reply_enabled, active_reply_interval_sec, active_reply_start_time, rest_schedule_enabled, rest_schedule_start_minute, rest_schedule_end_minute, rest_awake_override, rest_awake_window_key, last_triggered_msg_id, created_at, updated_at)
+VALUES (@user_id, @contact_id, @name, @avatar_url, @persona_prompt, @timezone_offset_minutes, @context_limit, @active_reply_enabled, @active_reply_interval_sec, @active_reply_start_time, @rest_schedule_enabled, @rest_schedule_start_minute, @rest_schedule_end_minute, @rest_awake_override, @rest_awake_window_key, @last_triggered_msg_id, @created_at, @updated_at)
 ON CONFLICT(user_id, contact_id) DO UPDATE SET
   name=excluded.name,
   avatar_url=excluded.avatar_url,
   persona_prompt=excluded.persona_prompt,
+  timezone_offset_minutes=excluded.timezone_offset_minutes,
   context_limit=excluded.context_limit,
   active_reply_enabled=excluded.active_reply_enabled,
   active_reply_interval_sec=excluded.active_reply_interval_sec,
@@ -246,7 +251,7 @@ ON CONFLICT(user_id, contact_id) DO UPDATE SET
   messages_json=excluded.messages_json,
   updated_at=excluded.updated_at
 `);
-const getChatContextStmt = db.prepare(`SELECT messages_json FROM chat_contexts WHERE user_id = ? AND contact_id = ?`);
+const getChatContextStmt = db.prepare(`SELECT messages_json, updated_at FROM chat_contexts WHERE user_id = ? AND contact_id = ?`);
 const upsertPromptContextStmt = db.prepare(`
 INSERT INTO prompt_contexts (
   user_id, contact_id, worldbook_context, memory_context, important_state_context,
@@ -647,9 +652,26 @@ function parseRestScheduleClockToMinute(value, fallback) {
     return (hour * 60) + minute;
 }
 
+function normalizeTimezoneOffsetMinutes(value, fallback = 0) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return fallback;
+    return Math.max(-14 * 60, Math.min(14 * 60, Math.round(num)));
+}
+
 function formatRestWindowKey(dateLike) {
     const date = dateLike instanceof Date ? new Date(dateLike.getTime()) : new Date(dateLike || Date.now());
     return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+function formatShiftedRestWindowKey(dateLike) {
+    const date = dateLike instanceof Date ? new Date(dateLike.getTime()) : new Date(dateLike || Date.now());
+    return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}-${String(date.getUTCDate()).padStart(2, '0')}`;
+}
+
+function buildShiftedDateWithMinute(dateLike, minute) {
+    const date = dateLike instanceof Date ? new Date(dateLike.getTime()) : new Date(dateLike || Date.now());
+    date.setUTCHours(Math.floor(minute / 60), minute % 60, 0, 0);
+    return date;
 }
 
 function buildDateWithMinute(dateLike, minute) {
@@ -660,6 +682,10 @@ function buildDateWithMinute(dateLike, minute) {
 
 function getRestScheduleState(row, now = Date.now()) {
     const enabled = !!(row && (row.rest_schedule_enabled || row.restScheduleEnabled));
+    const timezoneOffsetMinutes = normalizeTimezoneOffsetMinutes(
+        row && (row.timezone_offset_minutes !== undefined ? row.timezone_offset_minutes : row.timezoneOffsetMinutes),
+        0
+    );
     const startMinute = normalizeRestScheduleMinute(
         row && (row.rest_schedule_start_minute !== undefined ? row.rest_schedule_start_minute : row.restScheduleStartMinute),
         21 * 60
@@ -668,8 +694,8 @@ function getRestScheduleState(row, now = Date.now()) {
         row && (row.rest_schedule_end_minute !== undefined ? row.rest_schedule_end_minute : row.restScheduleEndMinute),
         9 * 60
     );
-    const date = new Date(now);
-    const currentMinute = (date.getHours() * 60) + date.getMinutes();
+    const shiftedDate = new Date(now + (timezoneOffsetMinutes * 60000));
+    const currentMinute = (shiftedDate.getUTCHours() * 60) + shiftedDate.getUTCMinutes();
     let inRestWindow = false;
     let windowKey = null;
     let startTimeMs = null;
@@ -678,35 +704,35 @@ function getRestScheduleState(row, now = Date.now()) {
     if (enabled) {
         if (startMinute === endMinute) {
             inRestWindow = true;
-            windowKey = formatRestWindowKey(date);
-            const startDate = buildDateWithMinute(date, startMinute);
+            windowKey = formatShiftedRestWindowKey(shiftedDate);
+            const startDate = buildShiftedDateWithMinute(shiftedDate, startMinute);
             const endDate = new Date(startDate.getTime() + 86400000);
-            startTimeMs = startDate.getTime();
-            endTimeMs = endDate.getTime();
+            startTimeMs = startDate.getTime() - (timezoneOffsetMinutes * 60000);
+            endTimeMs = endDate.getTime() - (timezoneOffsetMinutes * 60000);
         } else if (startMinute < endMinute) {
             inRestWindow = currentMinute >= startMinute && currentMinute < endMinute;
             if (inRestWindow) {
-                windowKey = formatRestWindowKey(date);
-                startTimeMs = buildDateWithMinute(date, startMinute).getTime();
-                endTimeMs = buildDateWithMinute(date, endMinute).getTime();
+                windowKey = formatShiftedRestWindowKey(shiftedDate);
+                startTimeMs = buildShiftedDateWithMinute(shiftedDate, startMinute).getTime() - (timezoneOffsetMinutes * 60000);
+                endTimeMs = buildShiftedDateWithMinute(shiftedDate, endMinute).getTime() - (timezoneOffsetMinutes * 60000);
             }
         } else {
             inRestWindow = currentMinute >= startMinute || currentMinute < endMinute;
             if (inRestWindow) {
-                const startDate = new Date(date.getTime());
+                const startDate = new Date(shiftedDate.getTime());
                 if (currentMinute < endMinute) {
-                    startDate.setDate(startDate.getDate() - 1);
+                    startDate.setUTCDate(startDate.getUTCDate() - 1);
                 }
-                windowKey = formatRestWindowKey(startDate);
+                windowKey = formatShiftedRestWindowKey(startDate);
                 const endDate = new Date(startDate.getTime());
-                endDate.setDate(endDate.getDate() + 1);
-                startTimeMs = buildDateWithMinute(startDate, startMinute).getTime();
-                endTimeMs = buildDateWithMinute(endDate, endMinute).getTime();
+                endDate.setUTCDate(endDate.getUTCDate() + 1);
+                startTimeMs = buildShiftedDateWithMinute(startDate, startMinute).getTime() - (timezoneOffsetMinutes * 60000);
+                endTimeMs = buildShiftedDateWithMinute(endDate, endMinute).getTime() - (timezoneOffsetMinutes * 60000);
             }
         }
     }
 
-    return { enabled, inRestWindow, startMinute, endMinute, windowKey, startTimeMs, endTimeMs };
+    return { enabled, inRestWindow, startMinute, endMinute, windowKey, startTimeMs, endTimeMs, timezoneOffsetMinutes };
 }
 
 function isRestAwakeOverrideActive(row, now = Date.now(), restState = null) {
@@ -805,6 +831,7 @@ function serializeContactRow(row) {
         contactId: String(row.contact_id),
         avatarUrl: row.avatar_url || '',
         personaPrompt: row.persona_prompt || '',
+        timezoneOffsetMinutes: normalizeTimezoneOffsetMinutes(row.timezone_offset_minutes, 0),
         contextLimit: Number(row.context_limit || 0),
         activeReplyEnabled: !!row.active_reply_enabled,
         activeReplyIntervalSec: Number(row.active_reply_interval_sec || 0),
@@ -932,15 +959,55 @@ async function sendPushToUser(userId, payload) {
     return { enabled: true, delivered, removed };
 }
 
-function getRecentChatContext(userId, contactId) {
+function getRecentChatContextMeta(userId, contactId) {
     const row = getChatContextStmt.get(userId, String(contactId));
-    if (!row || !row.messages_json) return [];
+    if (!row || !row.messages_json) {
+        return { messages: [], updatedAt: 0 };
+    }
     try {
         const parsed = JSON.parse(row.messages_json);
-        return Array.isArray(parsed) ? parsed : [];
+        return {
+            messages: Array.isArray(parsed) ? parsed : [],
+            updatedAt: Number(row.updated_at || 0)
+        };
     } catch (err) {
-        return [];
+        return { messages: [], updatedAt: Number(row.updated_at || 0) };
     }
+}
+
+function getRecentChatContext(userId, contactId) {
+    return getRecentChatContextMeta(userId, contactId).messages;
+}
+
+function truncateLogText(value, maxLength = 90) {
+    const text = String(value || '').replace(/\s+/g, ' ').trim();
+    if (text.length <= maxLength) return text;
+    return `${text.slice(0, maxLength)}…`;
+}
+
+function buildContextPreviewForLog(messages, count = 5) {
+    const source = Array.isArray(messages) ? messages.slice(-count) : [];
+    return source.map((item) => ({
+        role: item && item.role === 'user' ? 'user' : 'assistant',
+        type: item && item.type ? String(item.type) : 'text',
+        time: Number(item && item.time || 0),
+        content: truncateLogText(item && item.content ? item.content : '')
+    }));
+}
+
+function buildPromptContextSummaryForLog(promptContext) {
+    const source = promptContext || {};
+    return {
+        updatedAt: Number(source.updated_at || 0),
+        importantState: String(source.important_state_context || '').length,
+        lookus: String(source.lookus_context || '').length,
+        memory: String(source.memory_context || '').length,
+        meeting: String(source.meeting_context || '').length,
+        worldbook: String(source.worldbook_context || '').length,
+        time: String(source.time_context || '').length,
+        calendar: String(source.calendar_context || '').length,
+        itinerary: String(source.itinerary_context || '').length
+    };
 }
 
 function getAiProfile(userId) {
@@ -949,7 +1016,9 @@ function getAiProfile(userId) {
 
 async function generateAiReplyContent(row, minutesPassed, triggerMode) {
     const profile = getAiProfile(row.user_id);
-    const recentContext = getRecentChatContext(row.user_id, row.contact_id);
+    const recentContextMeta = getRecentChatContextMeta(row.user_id, row.contact_id);
+    const recentContext = recentContextMeta.messages;
+    const promptContext = getPromptContextStmt.get(row.user_id, String(row.contact_id)) || {};
     const instruction = buildActiveReplyInstruction(row, minutesPassed, triggerMode);
     const cleanApiKey = String(profile && profile.api_key ? profile.api_key : '').replace(/[^\x00-\x7F]/g, '').trim();
 
@@ -981,6 +1050,23 @@ async function generateAiReplyContent(row, minutesPassed, triggerMode) {
     const contextLimit = Number(row.context_limit || 50) > 0 ? Number(row.context_limit) : 50;
     const systemPrompt = buildBackendWechatSystemPrompt(row, instruction);
     const contextMessages = convertContextMessagesForWechatPrompt(recentContext, contextLimit);
+    try {
+        console.log('[offline-ai] context preview', JSON.stringify({
+            userId: row.user_id,
+            contactId: String(row.contact_id),
+            contactName: row.name ? String(row.name).trim() : '',
+            triggerMode,
+            contextLimit,
+            storedChatContextCount: Array.isArray(recentContext) ? recentContext.length : 0,
+            sentContextCount: Array.isArray(contextMessages) ? contextMessages.length : 0,
+            chatContextUpdatedAt: Number(recentContextMeta.updatedAt || 0),
+            promptContext: buildPromptContextSummaryForLog(promptContext),
+            sentContextPreview: buildContextPreviewForLog(recentContext, 5),
+            instructionPreview: truncateLogText(instruction, 140)
+        }));
+    } catch (contextLogErr) {
+        console.error('[offline-ai] context preview logging failed', contextLogErr);
+    }
     const messages = [
         { role: 'system', content: systemPrompt },
         ...contextMessages,
@@ -1210,7 +1296,7 @@ function resolveActiveReplyTriggerDecision(row, now) {
         return {
             trigger: null,
             reason: 'in_rest_window',
-            detail: `window=${restState.windowKey || 'none'} awake=${isRestAwakeOverrideActive(row, now, restState) ? 1 : 0}`
+            detail: `window=${restState.windowKey || 'none'} awake=${isRestAwakeOverrideActive(row, now, restState) ? 1 : 0} tzOffset=${restState.timezoneOffsetMinutes}`
         };
     }
     const activeReplyStartTime = Number(row.active_reply_start_time || 0);
@@ -1291,7 +1377,7 @@ async function runActiveReplyCheck() {
 
     activeReplyCheckPromise = (async () => {
         const rows = db.prepare(`
-        SELECT c.user_id, c.contact_id, c.name, c.avatar_url, c.persona_prompt, c.context_limit, c.active_reply_enabled, c.active_reply_interval_sec, c.active_reply_start_time,
+        SELECT c.user_id, c.contact_id, c.name, c.avatar_url, c.persona_prompt, c.timezone_offset_minutes, c.context_limit, c.active_reply_enabled, c.active_reply_interval_sec, c.active_reply_start_time,
                c.rest_schedule_enabled, c.rest_schedule_start_minute, c.rest_schedule_end_minute, c.rest_awake_override, c.rest_awake_window_key,
                c.last_triggered_msg_id, c.last_triggered_at, c.last_seen_message_id,
                s.message_id, s.role, s.content, s.type, s.time
@@ -1407,6 +1493,10 @@ app.post('/api/contacts', (req, res) => {
     const now = Date.now();
     const userId = body.userId || 'default-user';
     const contactId = String(body.contactId);
+    const timezoneOffsetMinutes = normalizeTimezoneOffsetMinutes(
+        body.timezoneOffsetMinutes !== undefined ? body.timezoneOffsetMinutes : body.timezone_offset_minutes,
+        0
+    );
     const requestedRestEnabled = body.restWindowEnabled !== undefined
         ? !!body.restWindowEnabled
         : !!body.restScheduleEnabled;
@@ -1462,6 +1552,7 @@ app.post('/api/contacts', (req, res) => {
         name: body.name || '',
         avatar_url: String(body.avatarUrl || '').trim(),
         persona_prompt: body.personaPrompt || '',
+        timezone_offset_minutes: timezoneOffsetMinutes,
         context_limit: Math.max(0, Math.round(Number(body.contextLimit || 0))) || 50,
         active_reply_enabled: body.activeReplyEnabled ? 1 : 0,
         active_reply_interval_sec: Math.max(1, Math.round(Number.isFinite(requestedIntervalSec) ? requestedIntervalSec : 60)),
@@ -1552,7 +1643,7 @@ app.post('/api/messages/delete', (req, res) => {
 app.post('/api/debug/trigger-active-reply', async (req, res) => {
     const body = req.body || {};
     const row = db.prepare(`
-        SELECT c.user_id, c.contact_id, c.name, c.avatar_url, c.persona_prompt, c.context_limit, c.active_reply_enabled, c.active_reply_interval_sec, c.active_reply_start_time,
+        SELECT c.user_id, c.contact_id, c.name, c.avatar_url, c.persona_prompt, c.timezone_offset_minutes, c.context_limit, c.active_reply_enabled, c.active_reply_interval_sec, c.active_reply_start_time,
                c.rest_schedule_enabled, c.rest_schedule_start_minute, c.rest_schedule_end_minute, c.rest_awake_override, c.rest_awake_window_key,
                c.last_triggered_msg_id,
                s.message_id, s.role, s.content, s.type, s.time
