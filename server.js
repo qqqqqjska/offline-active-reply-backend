@@ -1,4 +1,4 @@
-import express from 'express';
+﻿import express from 'express';
 import cors from 'cors';
 import Database from 'better-sqlite3';
 import path from 'path';
@@ -172,7 +172,7 @@ if (!aiProfileTableColumns.some((column) => column && column.name === 'default_v
 }
 
 app.use(cors({ origin: APP_ORIGIN === '*' ? true : APP_ORIGIN, credentials: false }));
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '8mb' }));
 
 const upsertContactStmt = db.prepare(`
 INSERT INTO contacts (user_id, contact_id, name, avatar_url, persona_prompt, context_limit, active_reply_enabled, active_reply_interval_sec, active_reply_start_time, rest_schedule_enabled, rest_schedule_start_minute, rest_schedule_end_minute, rest_awake_override, rest_awake_window_key, last_triggered_msg_id, created_at, updated_at)
