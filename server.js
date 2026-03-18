@@ -140,6 +140,7 @@ CREATE TABLE IF NOT EXISTS prompt_contexts (
   time_context TEXT NOT NULL DEFAULT '',
   calendar_context TEXT NOT NULL DEFAULT '',
   itinerary_context TEXT NOT NULL DEFAULT '',
+  frontend_system_prompt TEXT NOT NULL DEFAULT '',
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (user_id, contact_id)
 );
@@ -175,6 +176,11 @@ if (!aiProfileTableColumns.some((column) => column && column.name === 'default_v
     db.exec(`ALTER TABLE ai_profiles ADD COLUMN default_virtual_image_url TEXT NOT NULL DEFAULT ''`);
 }
 
+
+const promptContextTableColumns = db.prepare(`PRAGMA table_info(prompt_contexts)`).all();
+if (!promptContextTableColumns.some((column) => column && column.name === 'frontend_system_prompt')) {
+    db.exec(`ALTER TABLE prompt_contexts ADD COLUMN frontend_system_prompt TEXT NOT NULL DEFAULT ''`);
+}
 app.use(cors({ origin: APP_ORIGIN === '*' ? true : APP_ORIGIN, credentials: false }));
 app.use(express.json({ limit: '8mb' }));
 
@@ -255,11 +261,11 @@ const getChatContextStmt = db.prepare(`SELECT messages_json, updated_at FROM cha
 const upsertPromptContextStmt = db.prepare(`
 INSERT INTO prompt_contexts (
   user_id, contact_id, worldbook_context, memory_context, important_state_context,
-  lookus_context, meeting_context, time_context, calendar_context, itinerary_context, updated_at
+  lookus_context, meeting_context, time_context, calendar_context, itinerary_context, frontend_system_prompt, updated_at
 )
 VALUES (
   @user_id, @contact_id, @worldbook_context, @memory_context, @important_state_context,
-  @lookus_context, @meeting_context, @time_context, @calendar_context, @itinerary_context, @updated_at
+  @lookus_context, @meeting_context, @time_context, @calendar_context, @itinerary_context, @frontend_system_prompt, @updated_at
 )
 ON CONFLICT(user_id, contact_id) DO UPDATE SET
   worldbook_context=excluded.worldbook_context,
@@ -270,6 +276,7 @@ ON CONFLICT(user_id, contact_id) DO UPDATE SET
   time_context=excluded.time_context,
   calendar_context=excluded.calendar_context,
   itinerary_context=excluded.itinerary_context,
+  frontend_system_prompt=excluded.frontend_system_prompt,
   updated_at=excluded.updated_at
 `);
 const getPromptContextStmt = db.prepare(`SELECT * FROM prompt_contexts WHERE user_id = ? AND contact_id = ?`);
@@ -299,6 +306,44 @@ function trimWechatPromptSection(section) {
 
 function joinWechatPromptSections(sections) {
     return sections.map(trimWechatPromptSection).filter(Boolean).join('\n\n');
+}
+
+function escapeContextAttrText(text) {
+    return String(text || '')
+        .replace(/[\r\n]+/g, ' ')
+        .replace(/"/g, "'")
+        .trim();
+}
+
+function buildContextRecordPrefix(msg) {
+    if (!msg) return '';
+    const msgId = escapeContextAttrText(msg.id || '');
+    const timestamp = Number.isFinite(Number(msg.time)) ? Number(msg.time) : '';
+    const role = escapeContextAttrText(msg.role || 'assistant');
+    const type = escapeContextAttrText(msg.type || 'text');
+    return `[context_record msg_id="${msgId}" timestamp="${timestamp}" role="${role}" type="${type}"]`;
+}
+
+function joinContextTextParts(...parts) {
+    return parts
+        .map(part => typeof part === 'string' ? part.trim() : '')
+        .filter(Boolean)
+        .join('\n')
+        .trim();
+}
+
+function buildTimeGapHint(fromTime, toTime) {
+    const start = Number(fromTime || 0);
+    const end = Number(toTime || 0);
+    if (!start || !end || end <= start) return '';
+    const timeDiff = end - start;
+    const minutes = Math.floor(timeDiff / 60000);
+    const hours = Math.floor(timeDiff / 3600000);
+    const days = Math.floor(timeDiff / 86400000);
+    if (days >= 1) return `[time_gap: ${days}d ${hours % 24}h since previous message]`;
+    if (hours >= 2) return `[time_gap: ${hours}h since previous message]`;
+    if (minutes >= 30) return `[time_gap: ${minutes}m since previous message]`;
+    return '';
 }
 
 function buildWechatRolePromptLite(row) {
@@ -341,8 +386,10 @@ function buildWechatBaseCapabilityPromptLite() {
     ].join('\n');
 }
 
-function buildBackendWechatSystemPrompt(row, activeInstruction) {
+function buildBackendWechatSystemPrompt(row) {
     const promptContext = getPromptContextStmt.get(row.user_id, String(row.contact_id)) || {};
+    const syncedFrontendPrompt = trimWechatPromptSection(promptContext.frontend_system_prompt || '');
+    if (syncedFrontendPrompt) return syncedFrontendPrompt;
     return joinWechatPromptSections([
         buildWechatRolePromptLite(row),
         buildWechatProtocolPromptLite(),
@@ -356,19 +403,46 @@ function buildBackendWechatSystemPrompt(row, activeInstruction) {
         promptContext.time_context || '',
         promptContext.calendar_context || '',
         promptContext.itinerary_context || '',
-        `【回复指令】\n${trimWechatPromptSection(activeInstruction)}`
+        "[reply_instruction] Reply naturally to the other person's message."
     ]);
 }
-function convertContextMessagesForWechatPrompt(recentContext, limit) {
+function convertContextMessagesForWechatPrompt(recentContext, limit, options = {}) {
     const source = Array.isArray(recentContext) ? recentContext.slice(-(limit > 0 ? limit : 50)) : [];
-    return source
-        .filter(item => item && typeof item.content === 'string' && item.content.trim())
-        .map(item => ({
-            role: item.role === 'user' ? 'user' : 'assistant',
-            content: String(item.content || '').trim()
-        }));
+    const realTimeVisible = !!options.realTimeVisible;
+    const imageLimit = Number(options.imageLimit || 3) > 0 ? Number(options.imageLimit || 3) : 3;
+    const prepared = source.filter(item => item && typeof item.content === 'string' && item.content.trim()).map(item => ({ ...item }));
+    let imageCount = 0;
+    for (let i = prepared.length - 1; i >= 0; i -= 1) { if (prepared[i].type === 'image') { imageCount += 1; if (imageCount > imageLimit) prepared[i]._skipImage = true; } }
+    const normalized = [];
+    for (let i = 0; i < prepared.length; i += 1) {
+        const item = prepared[i];
+        const structuredPrefix = buildContextRecordPrefix(item);
+        let content = String(item.content || '').trim();
+        content = content.replace(/\[(sent )?(sticker|image|voice).*?\]/gi, '').trim();
+        let finalContent = '';
+        if (item.type === 'image') {
+            finalContent = item._skipImage ? joinContextTextParts(structuredPrefix, '[image]') : joinContextTextParts(structuredPrefix, `[image: ${content}]`);
+        } else if (item.type === 'virtual_image') {
+            const desc = item.description ? `: ${String(item.description).trim()}` : '';
+            finalContent = joinContextTextParts(structuredPrefix, `[image${desc}]`);
+        } else if (item.type === 'sticker') {
+            const desc = item.description ? `: ${String(item.description).trim()}` : '';
+            finalContent = joinContextTextParts(structuredPrefix, `[sticker${desc}]`);
+        } else if (item.type === 'voice') {
+            let voiceText = 'voice message';
+            try { const data = JSON.parse(content); voiceText = data.text || voiceText; } catch (err) { voiceText = content || voiceText; }
+            finalContent = joinContextTextParts(structuredPrefix, `[voice: ${voiceText}]`);
+        } else {
+            finalContent = joinContextTextParts(structuredPrefix, content);
+        }
+        if (finalContent) normalized.push({ role: item.role === 'user' ? 'user' : 'assistant', content: finalContent });
+        if (realTimeVisible && i < prepared.length - 1) {
+            const gapHint = buildTimeGapHint(item.time, prepared[i + 1] && prepared[i + 1].time);
+            if (gapHint) normalized.push({ role: 'system', content: gapHint, _isTimeGap: true });
+        }
+    }
+    return normalized;
 }
-
 function extractJsonBlocksFromText(text) {
     const source = String(text || '');
     const found = [];
@@ -1055,7 +1129,8 @@ function buildPromptContextSummaryForLog(promptContext) {
         worldbook: String(source.worldbook_context || '').length,
         time: String(source.time_context || '').length,
         calendar: String(source.calendar_context || '').length,
-        itinerary: String(source.itinerary_context || '').length
+        itinerary: String(source.itinerary_context || '').length,
+        frontendSystemPrompt: String(source.frontend_system_prompt || '').length,
     };
 }
 
@@ -1097,8 +1172,11 @@ async function generateAiReplyContent(row, minutesPassed, triggerMode) {
     }
 
     const contextLimit = Number(row.context_limit || 50) > 0 ? Number(row.context_limit) : 50;
-    const systemPrompt = buildBackendWechatSystemPrompt(row, instruction);
-    const contextMessages = convertContextMessagesForWechatPrompt(recentContext, contextLimit);
+    const systemPrompt = buildBackendWechatSystemPrompt(row);
+    const contextMessages = convertContextMessagesForWechatPrompt(recentContext, contextLimit, {
+        realTimeVisible: !!promptContext.time_context,
+        imageLimit: 3
+    });
     try {
         console.log('[offline-ai] context preview', JSON.stringify({
             userId: row.user_id,
@@ -1111,7 +1189,9 @@ async function generateAiReplyContent(row, minutesPassed, triggerMode) {
             chatContextUpdatedAt: Number(recentContextMeta.updatedAt || 0),
             promptContext: buildPromptContextSummaryForLog(promptContext),
             sentContextPreview: buildContextPreviewForLog(recentContext, 5),
-            instructionPreview: truncateLogText(instruction, 140)
+            instructionPreview: truncateLogText(instruction, 140),
+            systemPromptPreview: truncateLogText(systemPrompt, 180),
+            usingFrontendSystemPrompt: !!trimWechatPromptSection(promptContext.frontend_system_prompt || '')
         }));
     } catch (contextLogErr) {
         console.error('[offline-ai] context preview logging failed', contextLogErr);
@@ -1119,7 +1199,7 @@ async function generateAiReplyContent(row, minutesPassed, triggerMode) {
     const messages = [
         { role: 'system', content: systemPrompt },
         ...contextMessages,
-        { role: 'system', content: `以下是本次主动回复的附加要求，请理解后自然回复，不要直接复述：\n${instruction}` }
+        { role: 'system', content: `[system_instruction] ${instruction}` }
     ];
 
     const requestPayload = {
@@ -1610,6 +1690,7 @@ app.post('/api/prompt-context', (req, res) => {
         time_context: String(body.timeContext || ''),
         calendar_context: String(body.calendarContext || ''),
         itinerary_context: String(body.itineraryContext || ''),
+        frontend_system_prompt: String(body.frontendSystemPrompt || ''),
         updated_at: Date.now()
     });
     res.json({ ok: true });
