@@ -570,6 +570,26 @@ function extractTextFromAiResponsePart(part) {
     if (typeof part.value === 'string') return part.value;
     if (typeof part.content === 'string') return part.content;
     if (typeof part.output_text === 'string') return part.output_text;
+    if (typeof part.response_text === 'string') return part.response_text;
+    if (typeof part.generated_text === 'string') return part.generated_text;
+    if (typeof part.reasoning_text === 'string') return part.reasoning_text;
+    if (typeof part.caption === 'string') return part.caption;
+
+    if (Array.isArray(part.parts)) {
+        return part.parts.map((item) => extractTextFromAiResponsePart(item)).filter(Boolean).join('\n');
+    }
+
+    if (Array.isArray(part.candidates)) {
+        return part.candidates.map((item) => extractTextFromAiResponsePart(item)).filter(Boolean).join('\n');
+    }
+
+    if (part.message) {
+        return extractTextFromAiResponsePart(part.message);
+    }
+
+    if (part.delta) {
+        return extractTextFromAiResponsePart(part.delta);
+    }
 
     if (Array.isArray(part.content)) {
         return part.content.map((item) => extractTextFromAiResponsePart(item)).filter(Boolean).join('\n');
@@ -578,16 +598,45 @@ function extractTextFromAiResponsePart(part) {
     return '';
 }
 
+function buildAiResponsePreviewForLog(data) {
+    const choice = data && Array.isArray(data.choices) ? data.choices[0] : null;
+    const message = choice && choice.message ? choice.message : null;
+    const candidate = data && Array.isArray(data.candidates) ? data.candidates[0] : null;
+    const topKeys = data && typeof data === 'object' ? Object.keys(data).slice(0, 20) : [];
+    const choiceKeys = choice && typeof choice === 'object' ? Object.keys(choice).slice(0, 20) : [];
+    const messageKeys = message && typeof message === 'object' ? Object.keys(message).slice(0, 20) : [];
+    const candidateKeys = candidate && typeof candidate === 'object' ? Object.keys(candidate).slice(0, 20) : [];
+    const output0 = data && Array.isArray(data.output) && data.output[0] ? data.output[0] : null;
+    const output0Keys = output0 && typeof output0 === 'object' ? Object.keys(output0).slice(0, 20) : [];
+    return {
+        topKeys,
+        choiceKeys,
+        messageKeys,
+        candidateKeys,
+        output0Keys,
+        preview: truncateLogText(JSON.stringify(data), 700)
+    };
+}
+
 function extractReplyContentFromAiResponse(data) {
     const choice = data && Array.isArray(data.choices) ? data.choices[0] : null;
     const message = choice && choice.message ? choice.message : null;
+    const candidate = data && Array.isArray(data.candidates) ? data.candidates[0] : null;
 
     const candidates = [
         { source: 'choices[0].message.content', value: message ? message.content : null },
+        { source: 'choices[0].message.parts', value: message ? message.parts : null },
+        { source: 'choices[0].message', value: message },
         { source: 'choices[0].text', value: choice ? choice.text : null },
         { source: 'choices[0].delta.content', value: choice && choice.delta ? choice.delta.content : null },
+        { source: 'choices[0].delta', value: choice && choice.delta ? choice.delta : null },
+        { source: 'candidates[0].content.parts', value: candidate && candidate.content ? candidate.content.parts : null },
+        { source: 'candidates[0].content', value: candidate && candidate.content ? candidate.content : null },
+        { source: 'candidates[0]', value: candidate },
         { source: 'output_text', value: data ? data.output_text : null },
-        { source: 'output[0].content', value: data && Array.isArray(data.output) && data.output[0] ? data.output[0].content : null }
+        { source: 'output[0].content', value: data && Array.isArray(data.output) && data.output[0] ? data.output[0].content : null },
+        { source: 'output[0]', value: data && Array.isArray(data.output) && data.output[0] ? data.output[0] : null },
+        { source: 'data', value: data }
     ];
 
     for (const candidate of candidates) {
@@ -1095,7 +1144,27 @@ async function generateAiReplyContent(row, minutesPassed, triggerMode) {
         const data = await response.json();
         const extractedReply = extractReplyContentFromAiResponse(data);
         const content = String(extractedReply.content || '').trim();
+        try {
+            console.log('[offline-ai] response extraction', JSON.stringify({
+                userId: row.user_id,
+                contactId: String(row.contact_id),
+                source: extractedReply.source,
+                extractedLength: content.length,
+                preview: truncateLogText(content, 240)
+            }));
+        } catch (extractLogErr) {
+            console.error('[offline-ai] response extraction logging failed', extractLogErr);
+        }
         if (!content) {
+            try {
+                console.log('[offline-ai] raw response preview', JSON.stringify({
+                    userId: row.user_id,
+                    contactId: String(row.contact_id),
+                    responsePreview: buildAiResponsePreviewForLog(data)
+                }));
+            } catch (rawPreviewErr) {
+                console.error('[offline-ai] raw response preview logging failed', rawPreviewErr);
+            }
             throw new Error('empty ai reply');
         }
         const rawContent = content
