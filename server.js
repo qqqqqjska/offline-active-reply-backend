@@ -1122,72 +1122,130 @@ async function generateAiReplyContent(row, minutesPassed, triggerMode) {
         { role: 'system', content: `以下是本次主动回复的附加要求，请理解后自然回复，不要直接复述：\n${instruction}` }
     ];
 
-    try {
-        const response = await fetch(normalizeApiUrl(profile.api_url), {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${cleanApiKey}`
-            },
-            body: JSON.stringify({
-                model: profile.model,
-                messages,
-                temperature: Number(profile.temperature || 0.7)
-            })
-        });
+    const requestPayload = {
+        model: profile.model,
+        messages,
+        temperature: Number(profile.temperature || 0.7)
+    };
 
-        if (!response.ok) {
-            const text = await response.text().catch(() => '');
-            throw new Error(`API ${response.status}: ${text || response.statusText}`);
-        }
-
-        const data = await response.json();
-        const extractedReply = extractReplyContentFromAiResponse(data);
-        const content = String(extractedReply.content || '').trim();
+    const attemptGenerate = async (attempt) => {
         try {
-            console.log('[offline-ai] response extraction', JSON.stringify({
-                userId: row.user_id,
-                contactId: String(row.contact_id),
-                source: extractedReply.source,
-                extractedLength: content.length,
-                preview: truncateLogText(content, 240)
-            }));
-        } catch (extractLogErr) {
-            console.error('[offline-ai] response extraction logging failed', extractLogErr);
-        }
-        if (!content) {
+            const response = await fetch(normalizeApiUrl(profile.api_url), {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${cleanApiKey}`
+                },
+                body: JSON.stringify(requestPayload)
+            });
+
+            if (!response.ok) {
+                const text = await response.text().catch(() => '');
+                try {
+                    console.error('[offline-ai] api error', JSON.stringify({
+                        userId: row.user_id,
+                        contactId: String(row.contact_id),
+                        attempt,
+                        status: response.status,
+                        statusText: response.statusText,
+                        bodyPreview: truncateLogText(text, 700)
+                    }));
+                } catch (apiLogErr) {
+                    console.error('[offline-ai] api error logging failed', apiLogErr);
+                }
+                throw new Error(`API ${response.status}: ${text || response.statusText}`);
+            }
+
+            const data = await response.json();
+            const extractedReply = extractReplyContentFromAiResponse(data);
+            const content = String(extractedReply.content || '').trim();
             try {
-                console.log('[offline-ai] raw response preview', JSON.stringify({
+                console.log('[offline-ai] response extraction', JSON.stringify({
                     userId: row.user_id,
                     contactId: String(row.contact_id),
-                    responsePreview: buildAiResponsePreviewForLog(data)
+                    attempt,
+                    source: extractedReply.source,
+                    extractedLength: content.length,
+                    preview: truncateLogText(content, 240)
                 }));
-            } catch (rawPreviewErr) {
-                console.error('[offline-ai] raw response preview logging failed', rawPreviewErr);
+            } catch (extractLogErr) {
+                console.error('[offline-ai] response extraction logging failed', extractLogErr);
             }
-            throw new Error('empty ai reply');
-        }
-        const rawContent = content
-            .replace(/<thinking>[\s\S]*?<\/thinking>/g, '')
-            .replace(/<think>[\s\S]*?<\/think>/g, '')
-            .trim();
+            if (!content) {
+                try {
+                    console.log('[offline-ai] raw response preview', JSON.stringify({
+                        userId: row.user_id,
+                        contactId: String(row.contact_id),
+                        attempt,
+                        responsePreview: buildAiResponsePreviewForLog(data)
+                    }));
+                } catch (rawPreviewErr) {
+                    console.error('[offline-ai] raw response preview logging failed', rawPreviewErr);
+                }
+                throw new Error('empty ai reply');
+            }
 
-        return {
-            content: extractVisibleTextFromMixedResponse(content)
+            const rawContent = content
                 .replace(/<thinking>[\s\S]*?<\/thinking>/g, '')
                 .replace(/<think>[\s\S]*?<\/think>/g, '')
-                .trim() || fallbackMessage(row.name || '对方', row, triggerMode),
-            rawContent: rawContent || content,
-            usedFallback: false,
-            debug: extractedReply.source || 'ai_generated'
-        };
-    } catch (err) {
-        console.error('[offline-ai] generateAiReplyContent failed', err);
+                .trim();
+
+            return {
+                content: extractVisibleTextFromMixedResponse(content)
+                    .replace(/<thinking>[\s\S]*?<\/thinking>/g, '')
+                    .replace(/<think>[\s\S]*?<\/think>/g, '')
+                    .trim() || fallbackMessage(row.name || '对方', row, triggerMode),
+                rawContent: rawContent || content,
+                usedFallback: false,
+                debug: attempt > 1 ? `${extractedReply.source || 'ai_generated'}_retry${attempt}` : (extractedReply.source || 'ai_generated')
+            };
+        } catch (err) {
+            try {
+                console.error('[offline-ai] generate attempt failed', JSON.stringify({
+                    userId: row.user_id,
+                    contactId: String(row.contact_id),
+                    attempt,
+                    error: err && err.message ? err.message : String(err)
+                }));
+            } catch (attemptLogErr) {
+                console.error('[offline-ai] generate attempt logging failed', attemptLogErr);
+            }
+            throw err;
+        }
+    };
+
+    try {
+        return await attemptGenerate(1);
+    } catch (firstErr) {
+        if (String(firstErr && firstErr.message || '') === 'empty ai reply') {
+            try {
+                console.warn('[offline-ai] empty reply on first attempt, retrying once', JSON.stringify({
+                    userId: row.user_id,
+                    contactId: String(row.contact_id),
+                    triggerMode
+                }));
+            } catch (retryLogErr) {
+                console.error('[offline-ai] retry logging failed', retryLogErr);
+            }
+            try {
+                return await attemptGenerate(2);
+            } catch (retryErr) {
+                console.error('[offline-ai] generateAiReplyContent failed after retry', retryErr);
+                return {
+                    content: fallbackMessage(row.name || '对方', row, triggerMode),
+                    rawContent: fallbackMessage(row && row.name, row, triggerMode),
+                    usedFallback: true,
+                    debug: retryErr && retryErr.message ? retryErr.message : 'ai_error'
+                };
+            }
+        }
+
+        console.error('[offline-ai] generateAiReplyContent failed', firstErr);
         return {
             content: fallbackMessage(row.name || '对方', row, triggerMode),
             rawContent: fallbackMessage(row && row.name, row, triggerMode),
             usedFallback: true,
-            debug: err && err.message ? err.message : 'ai_error'
+            debug: firstErr && firstErr.message ? firstErr.message : 'ai_error'
         };
     }
 }
