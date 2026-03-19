@@ -557,6 +557,20 @@ function looksLikeThoughtStateFragment(text) {
     if (!value) return false;
     return /thought_state|display_text|character_thoughts/i.test(value);
 }
+
+function looksLikeIncompleteStructuredResponse(text) {
+    const value = String(text || '').trim();
+    if (!value) return false;
+    if (!/^[\[{]/.test(value)) return false;
+    if (!/("type"|"content"|text_message|quote_reply|sticker_message|image|voice)/i.test(value)) return false;
+    try {
+        JSON.parse(value);
+        return false;
+    } catch (err) {
+        return true;
+    }
+}
+
 function extractVisibleTextFromMixedResponse(rawText) {
     const text = String(rawText || '').trim();
     if (!text) return '';
@@ -588,6 +602,10 @@ function extractVisibleTextFromMixedResponse(rawText) {
     }
 
     if (looksLikeThoughtStateFragment(text)) {
+        return '';
+    }
+
+    if (looksLikeIncompleteStructuredResponse(text)) {
         return '';
     }
 
@@ -657,6 +675,10 @@ function extractVisibleMessagesFromMixedResponse(rawText, options = {}) {
     }
 
     if (looksLikeThoughtStateFragment(text)) {
+        return [];
+    }
+
+    if (looksLikeIncompleteStructuredResponse(text)) {
         return [];
     }
 
@@ -1230,20 +1252,27 @@ async function generateAiReplyContent(row, minutesPassed, triggerMode) {
     } catch (contextLogErr) {
         console.error('[offline-ai] context preview logging failed', contextLogErr);
     }
+    const activeReplyInstruction = [
+        `[系统提示]: ${instruction}`,
+        '继续严格遵守上面的输出协议。',
+        '你必须且只能返回一个标准 JSON 数组。',
+        '不要输出 Markdown 代码块，不要输出 JSON 数组之外的任何文本。',
+        '返回内容里至少要有一条用户可见消息；拿不准时请返回 text_message。'
+    ].join('\n');
+
     const messages = [
         { role: 'system', content: systemPrompt },
         ...contextMessages,
         {
-            role: 'user',
-            content: `${instruction}\n\n请直接输出这次要发给对方的消息内容，不要解释，不要分析，也不要重复系统提示。`
+            role: 'system',
+            content: activeReplyInstruction
         }
     ];
 
     const requestPayload = {
         model: profile.model,
         messages,
-        temperature: Number(profile.temperature || 0.7),
-        max_tokens: 320
+        temperature: Number(profile.temperature || 0.7)
     };
 
     const attemptGenerate = async (attempt) => {
@@ -1275,6 +1304,8 @@ async function generateAiReplyContent(row, minutesPassed, triggerMode) {
             }
 
             const data = await response.json();
+            const choice = data && Array.isArray(data.choices) ? data.choices[0] : null;
+            const finishReason = choice && choice.finish_reason ? choice.finish_reason : (data && data.finish_reason ? data.finish_reason : null);
             const extractedReply = extractReplyContentFromAiResponse(data);
             const content = String(extractedReply.content || '').trim();
             try {
@@ -1283,6 +1314,8 @@ async function generateAiReplyContent(row, minutesPassed, triggerMode) {
                     contactId: String(row.contact_id),
                     attempt,
                     source: extractedReply.source,
+                    finishReason,
+                    usage: data && data.usage ? data.usage : null,
                     extractedLength: content.length,
                     preview: truncateLogText(content, 240)
                 }));
