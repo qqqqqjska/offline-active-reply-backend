@@ -427,25 +427,58 @@ function buildBackendWechatSystemPrompt(row, options = {}) {
         "[reply_instruction] Reply naturally to the other person's message."
     ]);
 }
+
+function isInlineDataImageUrl(value) {
+    return /^data:image\//i.test(String(value || '').trim());
+}
+
+function sanitizeOfflinePromptImageValue(value, maxLength = 320) {
+    const text = String(value || '').replace(/\s+/g, ' ').trim();
+    if (!text) return '';
+    if (isInlineDataImageUrl(text)) return '';
+    if (isLikelyImagePreviewUrl(text)) return '';
+    if (text.length > maxLength) return '';
+    return text.replace(/^\[(?:image|图片)\]\s*/i, '').trim();
+}
+
+function buildOfflinePromptImageText(item) {
+    const description = sanitizeOfflinePromptImageValue(item && item.description, 320);
+    if (description) return `[image: ${description}]`;
+
+    const novelaiPrompt = sanitizeOfflinePromptImageValue(item && item.novelaiPrompt, 320);
+    if (novelaiPrompt) return `[image: ${novelaiPrompt}]`;
+
+    const content = sanitizeOfflinePromptImageValue(item && item.content, 320);
+    if (content) return `[image: ${content}]`;
+
+    return '[image]';
+}
+
 function convertContextMessagesForWechatPrompt(recentContext, limit, options = {}) {
     const source = Array.isArray(recentContext) ? recentContext.slice(-(limit > 0 ? limit : 50)) : [];
     const realTimeVisible = !!options.realTimeVisible;
     const imageLimit = Number(options.imageLimit || 3) > 0 ? Number(options.imageLimit || 3) : 3;
     const prepared = source.filter(item => item && typeof item.content === 'string' && item.content.trim()).map(item => ({ ...item }));
     let imageCount = 0;
-    for (let i = prepared.length - 1; i >= 0; i -= 1) { if (prepared[i].type === 'image') { imageCount += 1; if (imageCount > imageLimit) prepared[i]._skipImage = true; } }
+    for (let i = prepared.length - 1; i >= 0; i -= 1) {
+        const preparedContent = String(prepared[i] && prepared[i].content || '').trim();
+        if (prepared[i].type === 'image' || prepared[i].type === 'virtual_image' || isInlineDataImageUrl(preparedContent)) {
+            imageCount += 1;
+            if (imageCount > imageLimit) prepared[i]._skipImage = true;
+        }
+    }
     const normalized = [];
     for (let i = 0; i < prepared.length; i += 1) {
         const item = prepared[i];
         const structuredPrefix = buildContextRecordPrefix(item);
         let content = String(item.content || '').trim();
         content = content.replace(/\[(sent )?(sticker|image|voice).*?\]/gi, '').trim();
+        const treatAsImage = item.type === 'image' || item.type === 'virtual_image' || isInlineDataImageUrl(content);
         let finalContent = '';
-        if (item.type === 'image') {
-            finalContent = item._skipImage ? joinContextTextParts(structuredPrefix, '[image]') : joinContextTextParts(structuredPrefix, `[image: ${content}]`);
-        } else if (item.type === 'virtual_image') {
-            const desc = item.description ? `: ${String(item.description).trim()}` : '';
-            finalContent = joinContextTextParts(structuredPrefix, `[image${desc}]`);
+        if (treatAsImage) {
+            finalContent = item._skipImage
+                ? joinContextTextParts(structuredPrefix, '[image]')
+                : joinContextTextParts(structuredPrefix, buildOfflinePromptImageText(item));
         } else if (item.type === 'sticker') {
             const desc = item.description ? `: ${String(item.description).trim()}` : '';
             finalContent = joinContextTextParts(structuredPrefix, `[sticker${desc}]`);
