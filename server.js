@@ -388,12 +388,13 @@ function buildWechatBaseCapabilityPromptLite() {
 
 function buildOfflineActiveReplyPromptOverride() {
     return [
-        '????????????',
-        '- ??????????????????????????????????',
-        '- ???? thought_state????description?action?',
-        '- ??????????????????? JSON ??????? text_message?sticker_message?quote_reply?image?voice?',
-        '- ??????????????????????????????',
-        '- ?????????????????? text_message ???'
+        '【离线主动消息补充规则】',
+        '- 这是“联系人主动发消息”场景，你现在要直接产出一条用户可见的聊天消息。',
+        '- 不要输出 thought_state、display_text、character_thoughts、description、action 等内部字段。',
+        '- 优先直接输出自然、简短、口语化的纯文本消息。',
+        '- 如果必须结构化输出，只能返回 JSON 数组，元素类型仅允许 text_message、sticker_message、quote_reply、image、voice。',
+        '- 返回的内容里至少要有一条真正发给对方看的可见消息，不能只返回状态字段或空数组。',
+        '- 如果拿不准，就直接返回一条 text_message，内容是自然聊天文本。'
     ].join('\\n');
 }
 function buildBackendWechatSystemPrompt(row, options = {}) {
@@ -572,7 +573,7 @@ function extractVisibleTextFromMixedResponse(rawText) {
                 visibleTexts.push(item.reply_content.trim());
             }
             if (item.type === 'sticker_message' && typeof item.sticker === 'string' && item.sticker.trim()) {
-                visibleTexts.push(`[琛ㄦ儏鍖匽 ${item.sticker.trim()}`);
+                visibleTexts.push(`[表情包] ${item.sticker.trim()}`);
             }
             if (item.type === 'image' && typeof item.content === 'string' && item.content.trim()) {
                 visibleTexts.push(item.content.trim());
@@ -1307,14 +1308,22 @@ async function generateAiReplyContent(row, minutesPassed, triggerMode) {
                 .replace(/<think>[\s\S]*?<\/think>/g, '')
                 .trim();
 
+            const visibleContent = extractVisibleTextFromMixedResponse(content)
+                .replace(/<thinking>[\s\S]*?<\/thinking>/g, '')
+                .replace(/<think>[\s\S]*?<\/think>/g, '')
+                .trim();
+
+            const hasVisibleContent = !!visibleContent;
+            const fallbackContent = fallbackMessage(row.name || '对方', row, triggerMode);
+            const debugSource = attempt > 1
+                ? `${extractedReply.source || 'ai_generated'}_retry${attempt}`
+                : (extractedReply.source || 'ai_generated');
+
             return {
-                content: extractVisibleTextFromMixedResponse(content)
-                    .replace(/<thinking>[\s\S]*?<\/thinking>/g, '')
-                    .replace(/<think>[\s\S]*?<\/think>/g, '')
-                    .trim() || fallbackMessage(row.name || '对方', row, triggerMode),
-                rawContent: rawContent || content,
-                usedFallback: false,
-                debug: attempt > 1 ? `${extractedReply.source || 'ai_generated'}_retry${attempt}` : (extractedReply.source || 'ai_generated')
+                content: hasVisibleContent ? visibleContent : fallbackContent,
+                rawContent: hasVisibleContent ? (rawContent || content) : fallbackContent,
+                usedFallback: !hasVisibleContent,
+                debug: hasVisibleContent ? debugSource : `${debugSource}_no_visible_content`
             };
         } catch (err) {
             try {
