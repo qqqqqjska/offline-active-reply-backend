@@ -386,15 +386,35 @@ function buildWechatBaseCapabilityPromptLite() {
     ].join('\n');
 }
 
-function buildBackendWechatSystemPrompt(row) {
+function buildOfflineActiveReplyPromptOverride() {
+    return [
+        '????????????',
+        '- ??????????????????????????????????',
+        '- ???? thought_state????description?action?',
+        '- ??????????????????? JSON ??????? text_message?sticker_message?quote_reply?image?voice?',
+        '- ??????????????????????????????',
+        '- ?????????????????? text_message ???'
+    ].join('\\n');
+}
+function buildBackendWechatSystemPrompt(row, options = {}) {
     const promptContext = getPromptContextStmt.get(row.user_id, String(row.contact_id)) || {};
+    const offlineOverride = options && options.disableThoughtState
+        ? buildOfflineActiveReplyPromptOverride()
+        : '';
     const syncedFrontendPrompt = trimWechatPromptSection(promptContext.frontend_system_prompt || '');
-    if (syncedFrontendPrompt) return syncedFrontendPrompt;
+    if (syncedFrontendPrompt) {
+        return joinWechatPromptSections([
+            syncedFrontendPrompt,
+            offlineOverride,
+            "[reply_instruction] Reply naturally to the other person's message."
+        ]);
+    }
     return joinWechatPromptSections([
         buildWechatRolePromptLite(row),
         buildWechatProtocolPromptLite(),
         buildWechatHumanFeelPromptLite(),
         buildWechatBaseCapabilityPromptLite(),
+        offlineOverride,
         promptContext.important_state_context || '',
         promptContext.lookus_context || '',
         promptContext.memory_context || '',
@@ -531,6 +551,11 @@ function parseVisibleItemsFromMixedResponse(rawText) {
     return null;
 }
 
+function looksLikeThoughtStateFragment(text) {
+    const value = String(text || '').trim();
+    if (!value) return false;
+    return /thought_state|display_text|character_thoughts/i.test(value);
+}
 function extractVisibleTextFromMixedResponse(rawText) {
     const text = String(rawText || '').trim();
     if (!text) return '';
@@ -559,6 +584,10 @@ function extractVisibleTextFromMixedResponse(rawText) {
         if (visibleTexts.length > 0) {
             return visibleTexts.join('\n');
         }
+    }
+
+    if (looksLikeThoughtStateFragment(text)) {
+        return '';
     }
 
     return text;
@@ -624,6 +653,10 @@ function extractVisibleMessagesFromMixedResponse(rawText, options = {}) {
             }
         });
         return visibleMessages;
+    }
+
+    if (looksLikeThoughtStateFragment(text)) {
+        return [];
     }
 
     return splitPlainTextMessages(text);
@@ -1172,7 +1205,7 @@ async function generateAiReplyContent(row, minutesPassed, triggerMode) {
     }
 
     const contextLimit = Number(row.context_limit || 50) > 0 ? Number(row.context_limit) : 50;
-    const systemPrompt = buildBackendWechatSystemPrompt(row);
+    const systemPrompt = buildBackendWechatSystemPrompt(row, { disableThoughtState: true, triggerMode });
     const contextMessages = convertContextMessagesForWechatPrompt(recentContext, contextLimit, {
         realTimeVisible: !!promptContext.time_context,
         imageLimit: 3
@@ -1941,3 +1974,5 @@ app.listen(PORT, () => {
         console.log('[cron] Copy this value into Railway/Render environment variables and your external cron request header to keep it stable across redeploys');
     }
 });
+
+
