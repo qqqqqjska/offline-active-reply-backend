@@ -1199,13 +1199,17 @@ async function generateAiReplyContent(row, minutesPassed, triggerMode) {
     const messages = [
         { role: 'system', content: systemPrompt },
         ...contextMessages,
-        { role: 'system', content: `[system_instruction] ${instruction}` }
+        {
+            role: 'user',
+            content: `${instruction}\n\n请直接输出这次要发给对方的消息内容，不要解释，不要分析，也不要重复系统提示。`
+        }
     ];
 
     const requestPayload = {
         model: profile.model,
         messages,
-        temperature: Number(profile.temperature || 0.7)
+        temperature: Number(profile.temperature || 0.7),
+        max_tokens: 320
     };
 
     const attemptGenerate = async (attempt) => {
