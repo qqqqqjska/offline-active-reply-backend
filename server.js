@@ -249,6 +249,13 @@ SET rest_awake_override = @rest_awake_override,
 WHERE user_id = @user_id AND contact_id = @contact_id
 `);
 
+const hydrateActiveReplyStartTimeStmt = db.prepare(`
+UPDATE contacts
+SET active_reply_start_time = @active_reply_start_time,
+    updated_at = @updated_at
+WHERE user_id = @user_id AND contact_id = @contact_id
+`);
+
 const upsertSnapshotStmt = db.prepare(`
 INSERT INTO message_snapshots (user_id, contact_id, message_id, role, content, type, time, updated_at)
 VALUES (@user_id, @contact_id, @message_id, @role, @content, @type, @time, @updated_at)
@@ -1420,6 +1427,21 @@ function refreshStoredRestState(row, now = Date.now()) {
     }
     return normalized;
 }
+
+function normalizeActiveReplyStartTimeForEnabledContact(row, now = Date.now()) {
+    if (!row || !row.active_reply_enabled) return false;
+    const currentStartTime = Number(row.active_reply_start_time || 0);
+    if (currentStartTime > 0) return false;
+
+    row.active_reply_start_time = now;
+    hydrateActiveReplyStartTimeStmt.run({
+        user_id: row.user_id,
+        contact_id: String(row.contact_id),
+        active_reply_start_time: now,
+        updated_at: now
+    });
+    return true;
+}
 function serializeContactRow(row) {
     if (!row) return null;
     const now = Date.now();
@@ -2100,6 +2122,11 @@ async function runActiveReplyCheck() {
 
         for (const row of rows) {
             refreshStoredRestState(row, now);
+            const hydratedActiveReplyStartTime = normalizeActiveReplyStartTimeForEnabledContact(row, now);
+            if (hydratedActiveReplyStartTime) {
+                const label = `${row.name ? String(row.name).trim() : 'unknown'}#${String(row.contact_id)}`;
+                console.log(`[active-reply-hydrate] ${label} reason=missing_start_time action=set_start_time_now`);
+            }
             const decision = resolveActiveReplyTriggerDecision(row, now);
             const trigger = decision.trigger;
             const label = `${row.name ? String(row.name).trim() : 'unknown'}#${String(row.contact_id)}`;
@@ -2298,6 +2325,25 @@ app.post('/api/contacts', (req, res) => {
     const now = Date.now();
     const userId = body.userId || 'default-user';
     const contactId = String(body.contactId);
+    const existingContactRow = db.prepare(`SELECT * FROM contacts WHERE user_id = ? AND contact_id = ?`).get(userId, contactId);
+    const requestedActiveReplyEnabled = body.activeReplyEnabled !== undefined
+        ? !!body.activeReplyEnabled
+        : !!(existingContactRow && existingContactRow.active_reply_enabled);
+    const requestedActiveReplyStartTimeRaw = Number(body.activeReplyStartTime || 0);
+    const requestedActiveReplyStartTime = Number.isFinite(requestedActiveReplyStartTimeRaw)
+        ? Math.max(0, Math.round(requestedActiveReplyStartTimeRaw))
+        : 0;
+    const normalizedActiveReplyStartTime = requestedActiveReplyEnabled
+        ? (
+            requestedActiveReplyStartTime > 0
+                ? requestedActiveReplyStartTime
+                : (
+                    Number(existingContactRow && existingContactRow.active_reply_start_time || 0) > 0
+                        ? Number(existingContactRow.active_reply_start_time)
+                        : now
+                )
+        )
+        : 0;
     const timezoneOffsetMinutes = normalizeTimezoneOffsetMinutes(
         body.timezoneOffsetMinutes !== undefined ? body.timezoneOffsetMinutes : body.timezone_offset_minutes,
         0
@@ -2359,9 +2405,9 @@ app.post('/api/contacts', (req, res) => {
         persona_prompt: body.personaPrompt || '',
         timezone_offset_minutes: timezoneOffsetMinutes,
         context_limit: Math.max(0, Math.round(Number(body.contextLimit || 0))) || 50,
-        active_reply_enabled: body.activeReplyEnabled ? 1 : 0,
+        active_reply_enabled: requestedActiveReplyEnabled ? 1 : 0,
         active_reply_interval_sec: Math.max(1, Math.round(Number.isFinite(requestedIntervalSec) ? requestedIntervalSec : 60)),
-        active_reply_start_time: Number(body.activeReplyStartTime || 0),
+        active_reply_start_time: normalizedActiveReplyStartTime,
         rest_schedule_enabled: requestedRestEnabled ? 1 : 0,
         rest_schedule_start_minute: normalizedRestStartMinute,
         rest_schedule_end_minute: normalizedRestEndMinute,
